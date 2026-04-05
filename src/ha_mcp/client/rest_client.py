@@ -5,7 +5,7 @@ Home Assistant HTTP client with authentication and error handling.
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
 import httpx
 
@@ -405,6 +405,20 @@ class HomeAssistantClient:
             Logbook entries
         """
         logger.debug(f"Fetching logbook entries for entity: {entity_id}, start: {start_time}, end: {end_time}")
+
+        # Policy gating. The logbook REST endpoint leaks state-change history
+        # for every entity when no entity filter is set, and is not covered by
+        # the WS response filter. Require an entity_id under a policy and
+        # enforce can_read on it.
+        if self.policy is not None:
+            if not entity_id:
+                _deny(
+                    "<unfiltered>",
+                    operation="read:logbook",
+                    reason="logbook requires an entity_id filter under a policy",
+                )
+            if not await self.policy.can_read(entity_id):
+                _deny(entity_id, operation="read:logbook")
 
         # Build endpoint - start_time goes in URL path if provided
         if start_time:
@@ -903,6 +917,12 @@ class HomeAssistantClient:
         """
         from .websocket_client import get_websocket_client
 
+        # Pre-gate entity-scoped WS commands. Must run OUTSIDE the retry loop
+        # so the ToolError raised on denial isn't caught by the broad
+        # ``except Exception`` below and converted to ``{"success": False}``.
+        if self.policy is not None and not bypass_policy_filter.get():
+            await self._enforce_ws_message_policy(message)
+
         max_retries = 2
         retry_delay = 0.5  # seconds
 
@@ -959,6 +979,47 @@ class HomeAssistantClient:
 
         return {"success": False, "error": "WebSocket request failed"}
 
+    # Map of WebSocket command types → (operation name, request-field containing
+    # entity_id(s), read-or-write check). ``single`` means the field is a scalar
+    # entity_id; ``list`` means it's a list of entity_ids.
+    _WS_ENTITY_GATES: ClassVar[dict[str, tuple[str, str, str, str]]] = {
+        # todo list reads and writes take a single entity_id
+        "todo/item/list": ("todo/item/list", "entity_id", "single", "read"),
+        "todo/item/add": ("todo/item/add", "entity_id", "single", "write"),
+        "todo/item/update": ("todo/item/update", "entity_id", "single", "write"),
+        "todo/item/remove": ("todo/item/remove", "entity_id", "single", "write"),
+        "todo/item/move": ("todo/item/move", "entity_id", "single", "write"),
+        # voice-assistant expose settings are per-entity writes
+        "homeassistant/expose_entity": (
+            "homeassistant/expose_entity", "entity_ids", "list", "write"
+        ),
+    }
+
+    async def _enforce_ws_message_policy(self, message: dict[str, Any]) -> None:
+        """Deny entity-scoped WS commands touching unreadable/unwritable entities.
+
+        Raises ACCESS_DENIED (via ``_deny``) if the requested entity_id is
+        outside policy scope. Unknown command types pass through — the
+        post-response filter and/or the REST-layer gate handle them.
+        """
+        assert self.policy is not None  # narrowed by caller
+        gate = self._WS_ENTITY_GATES.get(message.get("type") or "")
+        if gate is None:
+            return
+        op, field, kind, access = gate
+        raw = message.get(field)
+        entity_ids: list[str] = (
+            _as_str_list(raw) if kind == "list"
+            else [str(raw)] if raw is not None
+            else []
+        )
+        if not entity_ids:
+            return
+        check = self.policy.can_write if access == "write" else self.policy.can_read
+        for eid in entity_ids:
+            if not await check(eid):
+                _deny(eid, operation=f"ws:{op}")
+
     def _should_filter_ws_response(self, result: Any) -> bool:
         """Decide whether ``_apply_policy_to_ws_response`` should run.
 
@@ -983,6 +1044,10 @@ class HomeAssistantClient:
           ACCESS_DENIED dict if the entity is not readable.
         - ``config/device_registry/list``: drop devices whose every entity
           is unreadable. Devices with zero registered entities are kept.
+        - ``homeassistant/expose_entity/list``: drop denied entity_ids from
+          the ``exposed_entities`` map.
+        - ``zone/list``: drop zones whose corresponding ``zone.{id}``
+          entity is not readable.
         - Other registry types (area, label) are passed through unchanged.
         """
         assert self.policy is not None  # narrowed by caller
@@ -1037,6 +1102,40 @@ class HomeAssistantClient:
                     or any(readable_map.get(eid, False) for eid in dev_entities)
                 ]
                 return {**result, "result": filtered_devices}
+
+            if command_type == "homeassistant/expose_entity/list":
+                payload = result.get("result")
+                if not isinstance(payload, dict):
+                    return result
+                exposed = payload.get("exposed_entities")
+                if not isinstance(exposed, dict):
+                    return result
+                decisions = await self.policy.can_read_batch(exposed.keys())
+                filtered_exposed = {
+                    eid: data for eid, data in exposed.items()
+                    if decisions.get(eid, False)
+                }
+                return {
+                    **result,
+                    "result": {**payload, "exposed_entities": filtered_exposed},
+                }
+
+            if command_type == "zone/list":
+                payload = result.get("result")
+                if not isinstance(payload, list):
+                    return result
+                # HA creates ``zone.{id}`` entities for storage-collection zones.
+                zone_entity_ids = [
+                    f"zone.{z['id']}" for z in payload
+                    if isinstance(z, dict) and z.get("id")
+                ]
+                decisions = await self.policy.can_read_batch(zone_entity_ids)
+                filtered_zones = [
+                    z for z in payload
+                    if isinstance(z, dict) and z.get("id")
+                    and decisions.get(f"zone.{z['id']}", False)
+                ]
+                return {**result, "result": filtered_zones}
         finally:
             bypass_policy_filter.reset(token)
 

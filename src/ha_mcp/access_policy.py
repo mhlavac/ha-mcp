@@ -499,6 +499,63 @@ def _rule_matches(rule: EntityRule, entity_id: str, meta: EntityMeta) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Tool-side enforcement helpers
+# ---------------------------------------------------------------------------
+
+
+async def require_can_read(
+    policy: AccessPolicy | None, entity_id: str, operation: str
+) -> None:
+    """Raise ACCESS_DENIED if ``policy`` denies reading ``entity_id``.
+
+    No-op when ``policy`` is None (no policy active → backward compat).
+    Used by tools that touch HA via code paths the client-layer gate
+    doesn't cover (direct httpx, direct REST endpoints, etc.).
+    """
+    from .errors import create_access_denied_error, raise_tool_error
+
+    if policy is None:
+        return
+    if not await policy.can_read(entity_id):
+        raise_tool_error(
+            create_access_denied_error(entity_id, operation=operation)
+        )
+
+
+async def require_can_write(
+    policy: AccessPolicy | None, entity_id: str, operation: str
+) -> None:
+    """Raise ACCESS_DENIED if ``policy`` denies writing ``entity_id``."""
+    from .errors import create_access_denied_error, raise_tool_error
+
+    if policy is None:
+        return
+    if not await policy.can_write(entity_id):
+        raise_tool_error(
+            create_access_denied_error(entity_id, operation=operation)
+        )
+
+
+def require_policy_disabled(
+    policy: AccessPolicy | None, tool_name: str, reason: str
+) -> None:
+    """Raise ACCESS_DENIED if a policy is active, refusing to run ``tool_name``.
+
+    Used for tools whose functionality cannot be safely gated per-entity
+    (e.g. Jinja template evaluation which can read any state). The caller
+    is expected to document an equivalent ``tools.disabled_names`` entry
+    so users can pre-empt the runtime denial.
+    """
+    from .errors import create_access_denied_error, raise_tool_error
+
+    if policy is None:
+        return
+    raise_tool_error(
+        create_access_denied_error(tool_name, operation=f"tool:{tool_name}", reason=reason)
+    )
+
+
 class PolicyLoadError(Exception):
     """Raised when a policy file cannot be loaded or validated."""
 
