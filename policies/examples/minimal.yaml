@@ -1,0 +1,9 @@
+# Why this policy
+# The fastest possible starting point: a pure allowlist.
+# Everything not listed is denied (default_action defaults to "deny").
+# Copy this file, edit the entity_globs, and point HAMCP_POLICY_FILE at it.
+
+version: 1
+entities:
+  allow:
+    - entity_globs: ["light.alice_*", "media_player.alice_sonos"]

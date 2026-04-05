@@ -1,0 +1,42 @@
+# Why this policy
+# Bob's counterpart to alice.yaml. Same structure, different names.
+# The pattern is: copy alice.yaml, swap "alice" -> "bob" and
+# "alice_bedroom" -> "bob_bedroom" everywhere.
+
+version: 1
+default_action: deny
+readonly_mode: false
+
+tools:
+  disabled_tags:
+    - "Add-ons"
+    - "HACS"
+    - "Files"
+    - "System"
+    - "Integrations"
+    - "Entity Registry"
+    - "Device Registry"
+    - "Labels & Categories"
+    - "History & Statistics"
+    - "Camera"
+    - "Calendar"
+  disabled_names:
+    - ha_config_set_yaml
+    - ha_eval_template
+
+entities:
+  allow:
+    - labels: ["owner:bob"]
+    - areas: ["bob_bedroom", "kitchen", "living_room"]
+    - entity_globs: ["media_player.shared_*", "weather.*"]
+
+  deny:
+    - entity_globs: ["lock.*", "alarm_control_panel.*"]
+    - labels: ["owner:alice", "owner:parents", "private"]
+
+  write_allow:
+    - labels: ["owner:bob"]
+    - areas: ["bob_bedroom"]
+
+  write_deny:
+    - entity_globs: ["climate.whole_house_*"]

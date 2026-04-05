@@ -81,6 +81,9 @@ class ErrorCode(StrEnum):
     # Component errors
     COMPONENT_NOT_INSTALLED = "COMPONENT_NOT_INSTALLED"
 
+    # Access policy errors
+    ACCESS_DENIED = "ACCESS_DENIED"
+
 
 # Default suggestions for common error codes
 DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
@@ -189,6 +192,10 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
     ErrorCode.COMPONENT_NOT_INSTALLED: [
         "Install the required custom component via HACS",
         "Restart Home Assistant after installation",
+    ],
+    ErrorCode.ACCESS_DENIED: [
+        "Entity is outside your access policy scope",
+        "Check the HAMCP_POLICY_FILE configuration",
     ],
 }
 
@@ -372,6 +379,27 @@ def create_timeout_error(
         f"Operation '{operation}' timed out after {timeout_seconds}s",
         details=details,
         context=final_context,
+    )
+
+
+def create_access_denied_error(
+    entity_id: str,
+    operation: str = "access",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Create an access denied error response for a policy-blocked entity.
+
+    Args:
+        entity_id: The entity the caller tried to reach
+        operation: The attempted operation (e.g. "read", "write", "call_service")
+        reason: Optional explanation of which rule blocked the request
+    """
+    detail = reason or "Entity is outside the configured access policy scope"
+    return create_error_response(
+        ErrorCode.ACCESS_DENIED,
+        f"Access denied for entity '{entity_id}' ({operation})",
+        details=detail,
+        context={"entity_id": entity_id, "operation": operation},
     )
 
 

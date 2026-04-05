@@ -18,6 +18,12 @@ import yaml  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from mcp.types import Icon
 
+from .access_policy import (
+    AccessPolicy,
+    EntityMetadataCache,
+    load_policy_from_file,
+    set_global_policy,
+)
 from .config import _PACKAGE_VERSION, get_global_settings
 from .tools.enhanced import EnhancedToolsMixin
 from .transforms import DEFAULT_PINNED_TOOLS
@@ -65,6 +71,11 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
         self._client: HomeAssistantClient | None = client
         self._client_provided = client is not None
 
+        # Load the access policy (if configured) BEFORE tool registration so
+        # the registry can consult it. Any failure to load a configured policy
+        # is fatal (fail-closed).
+        self._policy: AccessPolicy | None = self._load_policy()
+
         # Lazy initialization placeholders
         self._smart_tools: Any = None
         self._device_tools: Any = None
@@ -95,9 +106,39 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
         """Lazily create and return the Home Assistant client."""
         if self._client is None:
             from .client.rest_client import HomeAssistantClient
-            self._client = HomeAssistantClient()
+            self._client = HomeAssistantClient(policy=self._policy)
             logger.debug("Lazily created HomeAssistantClient")
         return self._client
+
+    def _load_policy(self) -> AccessPolicy | None:
+        """Load the access policy from disk (if configured).
+
+        Returns None when ``HAMCP_POLICY_FILE`` is unset. Any failure to load
+        a configured policy is fatal so the server does not silently fall
+        back to permissive behavior.
+        """
+        policy_path = self.settings.policy_file
+        if not policy_path:
+            set_global_policy(None)
+            return None
+
+        cfg = load_policy_from_file(policy_path)
+
+        # Ensure the lazy-initialized client carries the policy. When a client
+        # was injected we retrofit the policy onto it.
+        if self._client is None:
+            from .client.rest_client import HomeAssistantClient
+            client_for_cache = HomeAssistantClient()
+            self._client = client_for_cache
+        else:
+            client_for_cache = self._client
+
+        cache = EntityMetadataCache(client_for_cache)
+        policy = AccessPolicy(cfg, cache)
+        client_for_cache.policy = policy
+        set_global_policy(policy)
+        logger.info("Loaded access policy from %s", policy_path)
+        return policy
 
     @property
     def smart_tools(self) -> Any:
@@ -669,6 +710,17 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
                 logger.warning(f"⚠️ Failed to connect to Home Assistant: {error}")
         except Exception as e:
             logger.error(f"❌ Error testing connection: {e}")
+
+        # Pre-warm the access policy metadata cache (best-effort). If the
+        # websocket isn't ready yet it will be populated on first tool call.
+        if self._policy is not None:
+            try:
+                await self._policy.cache.ensure_fresh()
+                logger.info("Access policy metadata cache pre-warmed")
+            except Exception as e:
+                logger.warning(
+                    "Access policy cache pre-warm failed (will retry lazily): %s", e
+                )
 
         # Log available tools count
         logger.info("🔧 Smart server with enhanced tools loaded")

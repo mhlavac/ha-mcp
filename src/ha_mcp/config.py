@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # Examples: "tools_config_automations,tools_config_scripts,tools_traces"
     enabled_tool_modules: str = Field("all", alias="ENABLED_TOOL_MODULES")
 
+    # Access policy file (YAML) for fine-grained per-agent restrictions.
+    # Unset: no policy (backward-compat, everything allowed).
+    # Set: loaded at startup; missing/malformed file is a fatal error (fail-closed).
+    # See docs/access-policy.md for the schema.
+    policy_file: str | None = Field(None, alias="HAMCP_POLICY_FILE")
+
     # Dashboard partial update tools (python_transform, find_card)
     # These are token-efficient alternatives to full config replacement.
     # Disable when using clients with programmatic tool use (future).

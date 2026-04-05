@@ -23,7 +23,47 @@ import pkgutil
 from pathlib import Path
 from typing import Any
 
+from ..access_policy import AccessPolicy, get_global_policy
+
 logger = logging.getLogger(__name__)
+
+
+class PolicyAwareMCP:
+    """Thin proxy around a FastMCP server that gates ``.tool()`` registrations.
+
+    When a tool decorator is applied, the wrapped function is passed through
+    unchanged if the active policy rejects it (name/tag/readonly check).
+    All other attributes (``.resource``, ``.prompt``, ``.add_transform``, etc.)
+    are delegated to the underlying MCP server unchanged.
+    """
+
+    def __init__(self, mcp: Any, policy: AccessPolicy):
+        self._mcp = mcp
+        self._policy = policy
+
+    def tool(self, *args: Any, **kwargs: Any) -> Any:
+        """Intercept the ``.tool()`` decorator to skip policy-denied tools.
+
+        Mirrors FastMCP's decorator signature: ``@mcp.tool(name=..., tags=...,
+        annotations=...)`` — the tool name defaults to the function name.
+        """
+        tags = kwargs.get("tags")
+        annotations = kwargs.get("annotations")
+        explicit_name = kwargs.get("name")
+
+        def decorator(fn: Any) -> Any:
+            resolved_name = explicit_name or fn.__name__
+            tag_set: set[str] | None = set(tags) if tags else None
+            if not self._policy.is_tool_allowed(resolved_name, tag_set, annotations):
+                logger.info("Policy skipped tool: %s", resolved_name)
+                return fn
+            return self._mcp.tool(*args, **kwargs)(fn)
+
+        return decorator
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything else (resource, prompt, add_transform, run_async, ...)
+        return getattr(self._mcp, name)
 
 # Modules that don't follow the tools_*.py naming convention
 # These are handled explicitly for backward compatibility
@@ -150,6 +190,13 @@ class ToolsRegistry:
             "device_tools": self.device_tools,
         }
 
+        # Wrap MCP with policy-aware proxy if a policy is active. When there is
+        # no policy, tool registration goes straight through to FastMCP unchanged.
+        policy = get_global_policy()
+        mcp_for_registration: Any = (
+            PolicyAwareMCP(self.mcp, policy) if policy is not None else self.mcp
+        )
+
         registered_count = 0
 
         # Import and register tools_*.py modules
@@ -169,7 +216,7 @@ class ToolsRegistry:
                         break
 
                 if register_func:
-                    register_func(self.mcp, self.client, **kwargs)
+                    register_func(mcp_for_registration, self.client, **kwargs)
                     registered_count += 1
                     logger.debug(f"Registered tools from {module_name}")
                 else:
@@ -189,7 +236,7 @@ class ToolsRegistry:
             try:
                 module = importlib.import_module(f".{module_name}", "ha_mcp.tools")
                 register_func = getattr(module, func_name)
-                register_func(self.mcp, self.client, **kwargs)
+                register_func(mcp_for_registration, self.client, **kwargs)
                 registered_count += 1
                 logger.debug(f"Registered tools from {module_name}")
             except Exception as e:

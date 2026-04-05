@@ -5,13 +5,30 @@ Home Assistant HTTP client with authentication and error handling.
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+from fastmcp.exceptions import ToolError
 
+from ..access_policy import bypass_policy_filter
 from ..config import get_global_settings
+from ..errors import create_access_denied_error
+
+if TYPE_CHECKING:
+    from ..access_policy import AccessPolicy
 
 logger = logging.getLogger(__name__)
+
+
+def _deny(entity_id: str, operation: str, reason: str | None = None) -> ToolError:
+    """Construct a ToolError carrying an ACCESS_DENIED structured payload."""
+    return ToolError(
+        json.dumps(
+            create_access_denied_error(entity_id, operation=operation, reason=reason),
+            indent=2,
+            default=str,
+        )
+    )
 
 
 class HomeAssistantError(Exception):
@@ -51,6 +68,7 @@ class HomeAssistantClient:
         base_url: str | None = None,
         token: str | None = None,
         timeout: int | None = None,
+        policy: "AccessPolicy | None" = None,
     ):
         """
         Initialize Home Assistant client.
@@ -59,6 +77,8 @@ class HomeAssistantClient:
             base_url: Home Assistant URL (defaults to config)
             token: Long-lived access token (defaults to config)
             timeout: Request timeout in seconds (defaults to config)
+            policy: Optional AccessPolicy that gates entity-scoped reads/writes.
+                    When None, all calls pass through unchecked (backward compat).
         """
         # Only load settings if we need to use fallback values
         if base_url is None or token is None:
@@ -71,6 +91,8 @@ class HomeAssistantClient:
             self.base_url = base_url.rstrip("/")
             self.token = token
             self.timeout = timeout if timeout is not None else 30  # Default timeout
+
+        self.policy = policy
 
         # Create HTTP client with authentication headers
         self.httpx_client = httpx.AsyncClient(
@@ -161,6 +183,13 @@ class HomeAssistantClient:
         logger.debug("Fetching all entity states")
         result = await self._request("GET", "/states")
         if isinstance(result, list):
+            if self.policy is not None:
+                # Filter to readable entities in a single cache refresh.
+                entity_ids = [
+                    s.get("entity_id") for s in result if s.get("entity_id")
+                ]
+                readable = set(await self.policy.filter_entities(entity_ids))
+                return [s for s in result if s.get("entity_id") in readable]
             return result
         else:
             return []
@@ -175,6 +204,8 @@ class HomeAssistantClient:
         Returns:
             Entity state data
         """
+        if self.policy is not None and not await self.policy.can_read(entity_id):
+            raise _deny(entity_id, operation="read")
         logger.debug(f"Fetching state for entity: {entity_id}")
         return await self._request("GET", f"/states/{entity_id}")
 
@@ -192,6 +223,8 @@ class HomeAssistantClient:
         Returns:
             Updated entity state
         """
+        if self.policy is not None and not await self.policy.can_write(entity_id):
+            raise _deny(entity_id, operation="write")
         logger.debug(f"Setting state for entity {entity_id} to {state}")
 
         payload: dict[str, Any] = {"state": state}
@@ -222,6 +255,9 @@ class HomeAssistantClient:
 
         payload = data or {}
 
+        if self.policy is not None:
+            await self._enforce_service_call_policy(domain, service, payload)
+
         # Build query params for return_response
         params = {}
         if return_response:
@@ -242,6 +278,80 @@ class HomeAssistantClient:
             return result
         else:
             return []
+
+    async def _enforce_service_call_policy(
+        self, domain: str, service: str, payload: dict[str, Any]
+    ) -> None:
+        """Verify every entity implicated by a service call is writable.
+
+        Scans ``payload["entity_id"]`` AND ``payload["target"]`` (entity_id,
+        device_id, area_id, label_id) and expands each indirect target via
+        the metadata cache. Raises ACCESS_DENIED if any touched entity is
+        not writable, or if expansion of a target yields zero entities.
+        """
+        assert self.policy is not None  # narrowed by caller
+
+        def _as_list(v: Any) -> list[str]:
+            if v is None:
+                return []
+            if isinstance(v, list):
+                return [str(x) for x in v]
+            return [str(v)]
+
+        target = payload.get("target") or {}
+        if not isinstance(target, dict):
+            target = {}
+
+        # Direct entity_ids from both locations
+        entity_ids: set[str] = set()
+        entity_ids.update(_as_list(payload.get("entity_id")))
+        entity_ids.update(_as_list(target.get("entity_id")))
+
+        # HA accepts entity_id="all" as a wildcard affecting every entity of a
+        # domain. That cannot be reconciled with per-entity policy, so deny it
+        # outright regardless of default_action (which would otherwise treat
+        # "all" as an unknown entity and let it pass under default_action=allow).
+        if "all" in entity_ids:
+            raise _deny(
+                "all",
+                operation=f"call_service:{domain}.{service}",
+                reason="entity_id wildcard 'all' is not permitted under a policy",
+            )
+
+        # Indirect targets: expand via the policy's public target resolver.
+        device_ids = set(_as_list(target.get("device_id")))
+        area_ids = set(_as_list(target.get("area_id")))
+        label_ids = set(_as_list(target.get("label_id")))
+        had_indirect = bool(device_ids or area_ids or label_ids)
+        if had_indirect:
+            expanded = await self.policy.expand_targets(
+                device_ids=device_ids, area_ids=area_ids, label_ids=label_ids
+            )
+            entity_ids.update(expanded)
+            # If indirect targets were specified but nothing matched, deny.
+            if not entity_ids:
+                target_desc = (
+                    f"device_id={sorted(device_ids)}, "
+                    f"area_id={sorted(area_ids)}, "
+                    f"label_id={sorted(label_ids)}"
+                )
+                raise _deny(
+                    target_desc,
+                    operation=f"call_service:{domain}.{service}",
+                    reason="Target expanded to zero accessible entities",
+                )
+
+        # If no entities at all, nothing to gate (targetless service call).
+        if not entity_ids:
+            return
+
+        # Every touched entity must be writable.
+        for eid in sorted(entity_ids):
+            if not await self.policy.can_write(eid):
+                raise _deny(
+                    eid,
+                    operation=f"call_service:{domain}.{service}",
+                )
 
     async def get_services(self) -> dict[str, Any]:
         """Get all available services."""
@@ -818,6 +928,18 @@ class HomeAssistantClient:
                 command_type = message_copy.pop("type")
                 result = await ws_client.send_command(command_type, **message_copy)
 
+                # Policy filtering of registry responses (skipped while the
+                # policy's own cache is refreshing — see bypass_policy_filter).
+                if (
+                    self.policy is not None
+                    and not bypass_policy_filter.get()
+                    and isinstance(result, dict)
+                    and result.get("success") is not False
+                ):
+                    result = await self._apply_policy_to_ws_response(
+                        command_type, result
+                    )
+
                 return result
 
             except Exception as e:
@@ -849,6 +971,86 @@ class HomeAssistantClient:
                 return {"success": False, "error": str(e)}
 
         return {"success": False, "error": "WebSocket request failed"}
+
+    async def _apply_policy_to_ws_response(
+        self, command_type: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Filter registry responses according to the active policy.
+
+        - ``config/entity_registry/list``: drop entries whose entity_id is
+          not readable.
+        - ``config/entity_registry/get``: replace the result with an
+          ACCESS_DENIED dict if the entity is not readable.
+        - ``config/device_registry/list``: drop devices whose every entity
+          is unreadable. Devices with zero registered entities are kept.
+        - Other registry types (area, label) are passed through unchanged.
+        """
+        assert self.policy is not None  # narrowed by caller
+
+        # Enter bypass scope so the cache refresh triggered below doesn't
+        # recurse back through this filter.
+        token = bypass_policy_filter.set(True)
+        try:
+            if command_type == "config/entity_registry/list":
+                payload = result.get("result")
+                if not isinstance(payload, list):
+                    return result
+                entity_ids = [
+                    e.get("entity_id") for e in payload if e.get("entity_id")
+                ]
+                decisions = await self.policy.can_read_batch(entity_ids)
+                filtered = [
+                    e for e in payload
+                    if decisions.get(e.get("entity_id"), False)
+                ]
+                return {**result, "result": filtered}
+
+            if command_type == "config/entity_registry/get":
+                payload = result.get("result")
+                if not isinstance(payload, dict):
+                    return result
+                entity_id = payload.get("entity_id")
+                if entity_id and not await self.policy.can_read(entity_id):
+                    return create_access_denied_error(entity_id, operation="read")
+                return result
+
+            if command_type == "config/device_registry/list":
+                payload = result.get("result")
+                if not isinstance(payload, list):
+                    return result
+                # Build device_id -> set of its entity_ids from the policy cache.
+                # Cache is refreshed by the preceding can_read_batch calls in
+                # normal operation, but ensure freshness in case this is the
+                # first call that touches registries.
+                await self.policy.cache.ensure_fresh()
+                device_entities: dict[str, list[str]] = {}
+                for meta in self.policy.cache._entities.values():
+                    if meta.device_id:
+                        device_entities.setdefault(meta.device_id, []).append(
+                            meta.entity_id
+                        )
+                # Determine which entities are readable in one batch.
+                all_eids = {
+                    eid for eids in device_entities.values() for eid in eids
+                }
+                readable_map = (
+                    await self.policy.can_read_batch(all_eids) if all_eids else {}
+                )
+                filtered_devices = []
+                for dev in payload:
+                    dev_id = dev.get("id")
+                    dev_entities = device_entities.get(dev_id or "", [])
+                    if not dev_entities:
+                        # Device has no registered entities — keep it.
+                        filtered_devices.append(dev)
+                        continue
+                    if any(readable_map.get(eid, False) for eid in dev_entities):
+                        filtered_devices.append(dev)
+                return {**result, "result": filtered_devices}
+        finally:
+            bypass_policy_filter.reset(token)
+
+        return result
 
     async def _handle_render_template(
         self, ws_client: Any, message: dict[str, Any]

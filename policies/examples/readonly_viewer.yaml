@@ -1,0 +1,19 @@
+# Why this policy
+# A monitoring/dashboard agent that can see the whole house but never
+# touch anything. Use this for status summaries, morning briefings,
+# or any agent that should answer "what's going on?" without the
+# ability to act.
+#
+# readonly_mode: true is the kill-switch for all writes — it blocks
+# every tool that isn't explicitly marked readOnlyHint=True. This is
+# stricter than write_allow:[] because it also gates tools with no
+# entity_id (like ha_call_service, ha_backup_create).
+
+version: 1
+default_action: allow           # see everything
+readonly_mode: true             # write nothing
+
+entities:
+  # Optional: hide entities labeled "private" even from the viewer.
+  deny:
+    - labels: ["private"]

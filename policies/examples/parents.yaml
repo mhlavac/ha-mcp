@@ -1,0 +1,36 @@
+# Why this policy
+# Parents get broad access with specific carve-outs. default_action: allow
+# means "everything is permitted unless explicitly denied". Use this when
+# you want a permissive agent with guardrails, not an allowlist.
+#
+# Carve-outs here:
+#  - Kids' personal device trackers (phone location) are off-limits.
+#  - The agent cannot delete backups (but CAN create them).
+#  - ha_config_set_yaml is disabled to prevent raw YAML edits that
+#    could bypass every other rule in this file.
+
+version: 1
+default_action: allow           # permissive baseline
+readonly_mode: false
+
+tools:
+  disabled_names:
+    - ha_config_set_yaml        # raw YAML edits bypass per-entity gating
+    - ha_backup_restore         # restoring a backup = full system rollback
+
+entities:
+  # With default_action: allow, the `allow` list is redundant for reads.
+  # You only need `deny` and `write_deny` to carve things out.
+  deny:
+    # Don't let the agent track the kids' phones.
+    - entity_globs:
+        - "device_tracker.alice_*"
+        - "device_tracker.bob_*"
+    # Private entities (anything labeled "private") are completely hidden.
+    - labels: ["private"]
+
+  # Everything else is writable by default. These are extra write guards.
+  write_deny:
+    # Kids' devices are read-only from the parents' agent — parents can
+    # see state, but shouldn't remotely turn off a kid's bedside lamp.
+    - labels: ["owner:alice", "owner:bob"]

@@ -1,0 +1,59 @@
+# Why this policy
+# Alice is a kid. She can SEE her own bedroom, her Sonos, and shared
+# living spaces (kitchen, living room). She can only WRITE to things
+# explicitly tagged as hers (label owner:alice) or in her bedroom.
+# Locks, alarms, and whole-house climate are completely off-limits.
+# Config-surface tools (add-ons, files, system, registries, etc.) are
+# disabled so the agent can't reconfigure the house.
+
+version: 1
+default_action: deny            # principle of least privilege
+readonly_mode: false
+
+tools:
+  # "Kid preset" — see docs/access-policy.md for rationale.
+  # Disables config tools AND tools that reach HA via paths the
+  # entity-level gate doesn't cover (history/templates/camera/calendar).
+  disabled_tags:
+    # Config/reconfiguration surface:
+    - "Add-ons"
+    - "HACS"
+    - "Files"
+    - "System"
+    - "Integrations"
+    - "Entity Registry"
+    - "Device Registry"
+    - "Labels & Categories"
+    # Bypass-risk categories — fetch entity data without going
+    # through the gated REST path:
+    - "History & Statistics"
+    - "Camera"
+    - "Calendar"
+  # Individual tools to disable by exact name.
+  disabled_names:
+    - ha_config_set_yaml        # raw YAML edits bypass per-entity gating
+    - ha_eval_template          # Jinja can read any entity state
+
+entities:
+  # Read scope: her own stuff + shared spaces.
+  # Each list item is a separate rule (rules are OR'd).
+  allow:
+    - labels: ["owner:alice"]
+    - areas: ["alice_bedroom", "kitchen", "living_room"]
+    - entity_globs: ["media_player.shared_*", "weather.*"]
+
+  # Hard deny — overrides allow. Nothing below is ever readable.
+  deny:
+    - entity_globs: ["lock.*", "alarm_control_panel.*"]
+    - labels: ["owner:bob", "owner:parents", "private"]
+
+  # Write scope is NARROWER than read: Alice sees the kitchen ceiling
+  # light but can't turn it off while her parents are cooking.
+  # write_allow = list of rules (like `allow`) that restrict writes.
+  write_allow:
+    - labels: ["owner:alice"]
+    - areas: ["alice_bedroom"]
+
+  # Additional write blocklist on top of write_allow.
+  write_deny:
+    - entity_globs: ["climate.whole_house_*"]
