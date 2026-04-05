@@ -23,6 +23,11 @@ tools:
   disabled_names:
     - ha_config_set_yaml
     - ha_eval_template
+    - ha_get_integration
+
+services:
+  allow_targetless:
+    - persistent_notification.create
 
 entities:
   allow:

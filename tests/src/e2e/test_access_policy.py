@@ -739,6 +739,126 @@ class TestAccessPolicyBypassFixes:
             f"Denial should point to tools.disabled_names, got details={details!r}"
         )
 
+    # ---- Targetless service-call gating (commit TBD) ---------------------
+
+    async def test_policy_denies_targetless_service_by_default(
+        self, policy_mcp_client
+    ) -> None:
+        """Targetless service calls are denied unless explicitly allow-listed."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_call_service",
+            {
+                "domain": "persistent_notification",
+                "service": "create",
+                "data": {"message": "hi", "title": "test"},
+            },
+        )
+
+        assert _is_access_denied(data), (
+            f"Targetless service call should be ACCESS_DENIED by default, got {data}"
+        )
+        err = data.get("error") or {}
+        details = (err.get("details") or "") if isinstance(err, dict) else ""
+        assert "allow_targetless" in details.lower(), (
+            f"Denial should mention services.allow_targetless, got details={details!r}"
+        )
+
+    async def test_policy_allows_exact_targetless_service(
+        self, policy_mcp_client
+    ) -> None:
+        """A 'domain.service' entry in allow_targetless permits the exact call."""
+        yaml = """
+version: 1
+default_action: deny
+entities:
+  allow:
+    - labels: ["owner:alice"]
+services:
+  allow_targetless:
+    - persistent_notification.create
+"""
+        client = await policy_mcp_client(yaml)
+
+        result = await client.mcp.call_tool(
+            "ha_call_service",
+            {
+                "domain": "persistent_notification",
+                "service": "create",
+                "data": {
+                    "message": "allowed by exact spec",
+                    "title": "policy test",
+                },
+                "wait": False,
+            },
+        )
+        assert_mcp_success(
+            result, "targetless persistent_notification.create with exact allow"
+        )
+
+    async def test_policy_wildcard_targetless_allows_domain(
+        self, policy_mcp_client
+    ) -> None:
+        """A 'domain.*' entry permits every service in that domain."""
+        yaml = """
+version: 1
+default_action: deny
+entities:
+  allow:
+    - labels: ["owner:alice"]
+services:
+  allow_targetless:
+    - persistent_notification.*
+"""
+        client = await policy_mcp_client(yaml)
+
+        result = await client.mcp.call_tool(
+            "ha_call_service",
+            {
+                "domain": "persistent_notification",
+                "service": "create",
+                "data": {
+                    "message": "allowed by wildcard",
+                    "title": "policy test",
+                },
+                "wait": False,
+            },
+        )
+        assert_mcp_success(
+            result, "targetless persistent_notification.create with wildcard allow"
+        )
+
+    async def test_policy_targetless_allowlist_doesnt_affect_other_services(
+        self, policy_mcp_client
+    ) -> None:
+        """Allow-listing one service doesn't open the door to others."""
+        yaml = """
+version: 1
+default_action: deny
+entities:
+  allow:
+    - labels: ["owner:alice"]
+services:
+  allow_targetless:
+    - persistent_notification.create
+"""
+        client = await policy_mcp_client(yaml)
+
+        # Listed service: permitted
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_call_service",
+            {
+                "domain": "homeassistant",
+                "service": "check_config",
+            },
+        )
+        assert _is_access_denied(data), (
+            f"homeassistant.check_config is NOT in allow_targetless → must be denied, got {data}"
+        )
+
 
 @pytest.mark.asyncio
 class TestAccessPolicyBackwardCompat:
@@ -826,4 +946,21 @@ class TestAccessPolicyBackwardCompat:
         assert not _is_access_denied(integration_data), (
             f"ha_get_integration must NOT be ACCESS_DENIED without a policy, "
             f"got {integration_data}"
+        )
+
+        # Targetless service calls: the allow_targetless gate is a no-op
+        # without a policy, so persistent_notification.create passes through.
+        notif_data = await safe_call_tool(
+            client.mcp,
+            "ha_call_service",
+            {
+                "domain": "persistent_notification",
+                "service": "create",
+                "data": {"message": "no-policy", "title": "compat"},
+                "wait": False,
+            },
+        )
+        assert not _is_access_denied(notif_data), (
+            f"Targetless persistent_notification.create must NOT be denied without "
+            f"a policy, got {notif_data}"
         )

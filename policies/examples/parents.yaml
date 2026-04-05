@@ -18,6 +18,17 @@ tools:
     - ha_config_set_yaml        # raw YAML edits bypass per-entity gating
     - ha_backup_restore         # restoring a backup = full system rollback
 
+services:
+  # Parents need a broad targetless-call list to manage the house.
+  # Under `default_action: allow`, these are still required because
+  # targetless gating is orthogonal to per-entity gating.
+  allow_targetless:
+    - homeassistant.*           # check_config, reload, update_entity, ...
+    - persistent_notification.*
+    - automation.reload
+    - script.reload
+    - notify.*
+
 entities:
   # With default_action: allow, the `allow` list is redundant for reads.
   # You only need `deny` and `write_deny` to carve things out.

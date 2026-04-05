@@ -98,6 +98,7 @@ That's it. Everything not listed is denied. Copy, edit the patterns, done.
 | `entities.deny` | list[rule] | `[]` | Entities this agent can never see (overrides `allow`). |
 | `entities.write_allow` | list[rule] \| null | `null` | If `null`, inherits `allow`. If `[]`, blocks all writes. If non-empty, restricts writes further. |
 | `entities.write_deny` | list[rule] | `[]` | Entities the agent cannot write to (even if readable). |
+| `services.allow_targetless` | list[str] | `[]` | Targetless service calls (no `entity_id`/`target`) that are permitted. See [Targetless services](#targetless-services). |
 
 ### Entity rule fields
 
@@ -221,6 +222,29 @@ Given these entities:
 Alice sees the kitchen ceiling light and her closet light but can't touch
 them. She can change her own desk lamp. The garage light is invisible.
 
+## Targetless services
+
+Some HA service calls have no `entity_id` or `target` and cannot be gated
+per-entity: `homeassistant.restart`, `notify.telegram`, `persistent_notification.create`,
+`shell_command.reboot_pi`, `automation.reload`, `recorder.purge`, and so on.
+
+Under a policy, **targetless service calls are denied by default**. Opt in
+per service via `services.allow_targetless`:
+
+```yaml
+services:
+  allow_targetless:
+    - persistent_notification.create    # exact: one service
+    - notify.*                          # wildcard: every service in a domain
+```
+
+Entries must be `domain.service` or `domain.*` (lowercase). Anything not
+listed is denied — the denial response mentions `services.allow_targetless`
+so the agent knows to ask for an update.
+
+`readonly_mode: true` denies every targetless call regardless of the list —
+the allow-list is only consulted when writes are permitted at all.
+
 ## Tool disabling
 
 Some tools (backups, add-ons, YAML editing) don't have an entity_id and can't
@@ -248,14 +272,20 @@ tools:
     - "Entity Registry"
     - "Device Registry"
     - "Labels & Categories"
-    # Categories whose tools can read arbitrary entities without
-    # going through the gated REST path:
-    - "History & Statistics"   # history/stats WS commands fetch any entity
-    - "Camera"                 # direct httpx image fetch
-    - "Calendar"               # unfiltered REST call per calendar entity
+    # These are auto-gated per-entity now, but disabling keeps them out
+    # of the agent's tool list entirely (cleaner UX):
+    - "History & Statistics"
+    - "Camera"
+    - "Calendar"
   disabled_names:
     - ha_config_set_yaml       # raw YAML edits bypass every entity rule
-    - ha_eval_template         # Jinja can read any entity: {{ states('lock.front') }}
+    - ha_eval_template         # Jinja can read any entity (auto-denied too)
+    - ha_get_integration       # OAuth tokens in config entries (auto-denied too)
+
+services:
+  # Targetless calls are denied by default — opt in the ones you need:
+  allow_targetless:
+    - persistent_notification.create
 ```
 
 This leaves day-to-day control (lights, media players, climate, todo lists,
@@ -273,10 +303,12 @@ isolation:
    and the logbook REST endpoint, plus WebSocket responses from
    `entity_registry/*`, `device_registry/list`, `homeassistant/expose_entity/list`,
    and `zone/list`. Entity-scoped WS commands (`todo/item/*`,
-   `homeassistant/expose_entity`) are pre-gated before dispatch. This
-   covers the bulk of MCP tools — search, state reads, service calls,
-   automations, scripts, helpers, todo lists, voice-assistant exposure,
-   etc.
+   `homeassistant/expose_entity`) are pre-gated before dispatch. Targetless
+   service calls (no `entity_id`/`target`) are denied unless explicitly
+   allow-listed in `services.allow_targetless` — see
+   [Targetless services](#targetless-services). This covers the bulk of
+   MCP tools — search, state reads, service calls, automations, scripts,
+   helpers, todo lists, voice-assistant exposure, etc.
 
 2. **Tool layer (automatic for known bypasses):** Some tools reach Home
    Assistant through code paths the client layer doesn't cover (direct

@@ -12,8 +12,9 @@ readonly_mode: false
 
 tools:
   # "Kid preset" — see docs/access-policy.md for rationale.
-  # Disables config tools AND tools that reach HA via paths the
-  # entity-level gate doesn't cover (history/templates/camera/calendar).
+  # Disables config tools AND tools whose auto-gates would refuse them
+  # anyway at runtime. Disabling here means the tool never shows up in
+  # the agent's tool list in the first place (cleaner UX).
   disabled_tags:
     # Config/reconfiguration surface:
     - "Add-ons"
@@ -24,15 +25,23 @@ tools:
     - "Entity Registry"
     - "Device Registry"
     - "Labels & Categories"
-    # Bypass-risk categories — fetch entity data without going
-    # through the gated REST path:
+    # These are auto-gated per-entity now, but disabling keeps them out
+    # of the agent's view entirely:
     - "History & Statistics"
     - "Camera"
     - "Calendar"
   # Individual tools to disable by exact name.
   disabled_names:
     - ha_config_set_yaml        # raw YAML edits bypass per-entity gating
-    - ha_eval_template          # Jinja can read any entity state
+    - ha_eval_template          # Jinja can read any entity state (auto-denied too)
+    - ha_get_integration        # OAuth tokens in config entries (auto-denied too)
+
+services:
+  # Targetless service calls (no entity_id/target) are denied by default.
+  # Allow-list the ones Alice needs — she can ping parents via the UI
+  # notification tray.
+  allow_targetless:
+    - persistent_notification.create
 
 entities:
   # Read scope: her own stuff + shared spaces.

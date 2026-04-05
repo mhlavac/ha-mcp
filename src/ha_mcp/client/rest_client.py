@@ -338,9 +338,20 @@ class HomeAssistantClient:
                     reason="Target expanded to zero accessible entities",
                 )
 
-        # Targetless service calls (e.g. ``homeassistant.check_config``) are
-        # not gated — nothing to evaluate per-entity.
+        # Targetless service calls cannot be gated per-entity. Deny by default
+        # under a policy; users opt in via services.allow_targetless (e.g.
+        # "persistent_notification.create" or "notify.*").
         if not entity_ids:
+            if not self.policy.allows_targetless_service(domain, service):
+                _deny(
+                    f"{domain}.{service}",
+                    operation=op,
+                    reason=(
+                        "targetless service calls are denied by default under a "
+                        "policy; add 'domain.service' or 'domain.*' to "
+                        "services.allow_targetless to permit"
+                    ),
+                )
             return
 
         for eid in sorted(entity_ids):

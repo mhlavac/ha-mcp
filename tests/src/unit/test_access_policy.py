@@ -24,6 +24,7 @@ from ha_mcp.access_policy import (
     EntityRule,
     PolicyConfig,
     PolicyLoadError,
+    ServicesPolicy,
     ToolsPolicy,
     get_global_policy,
     load_policy_from_file,
@@ -390,6 +391,83 @@ class TestToolGating:
         cfg = PolicyConfig(readonly_mode=False)
         p = make_policy(cfg)
         assert p.is_tool_allowed("ha_call_service", annotations={})
+
+
+# ---------------------------------------------------------------------------
+# Service-call targetless allow-list
+# ---------------------------------------------------------------------------
+
+
+class TestTargetlessServices:
+    """services.allow_targetless controls whether targetless calls pass."""
+
+    def test_empty_list_denies_all(self):
+        p = make_policy(PolicyConfig())
+        assert not p.allows_targetless_service("homeassistant", "restart")
+        assert not p.allows_targetless_service("notify", "telegram")
+
+    def test_exact_domain_service_match(self):
+        cfg = PolicyConfig(
+            services=ServicesPolicy(
+                allow_targetless=["persistent_notification.create"]
+            )
+        )
+        p = make_policy(cfg)
+        assert p.allows_targetless_service("persistent_notification", "create")
+        # Different service in same domain → denied
+        assert not p.allows_targetless_service("persistent_notification", "dismiss")
+        # Different domain → denied
+        assert not p.allows_targetless_service("notify", "create")
+
+    def test_wildcard_covers_whole_domain(self):
+        cfg = PolicyConfig(
+            services=ServicesPolicy(allow_targetless=["notify.*"])
+        )
+        p = make_policy(cfg)
+        assert p.allows_targetless_service("notify", "telegram")
+        assert p.allows_targetless_service("notify", "persistent_notification")
+        # Other domain unaffected
+        assert not p.allows_targetless_service("homeassistant", "restart")
+
+    def test_mixed_exact_and_wildcard(self):
+        cfg = PolicyConfig(
+            services=ServicesPolicy(
+                allow_targetless=["notify.*", "persistent_notification.create"]
+            )
+        )
+        p = make_policy(cfg)
+        assert p.allows_targetless_service("notify", "anything")
+        assert p.allows_targetless_service("persistent_notification", "create")
+        assert not p.allows_targetless_service("persistent_notification", "dismiss")
+
+    def test_readonly_mode_denies_even_listed(self):
+        cfg = PolicyConfig(
+            readonly_mode=True,
+            services=ServicesPolicy(allow_targetless=["notify.*"]),
+        )
+        p = make_policy(cfg)
+        # readonly_mode overrides any allow_targetless entry
+        assert not p.allows_targetless_service("notify", "telegram")
+
+    def test_invalid_spec_rejected(self):
+        """Entries not matching 'domain.service' or 'domain.*' fail validation."""
+        import pytest
+        from pydantic import ValidationError
+
+        for bad in ["notify", "notify.*.extra", "NOTIFY.telegram", "notify.", ".create"]:
+            with pytest.raises(ValidationError):
+                ServicesPolicy(allow_targetless=[bad])
+
+    def test_domain_wildcard_shape(self):
+        """'.*' is only valid as a whole-service wildcard, not a prefix."""
+        import pytest
+        from pydantic import ValidationError
+
+        # Valid
+        ServicesPolicy(allow_targetless=["notify.*"])
+        # Invalid (no partial wildcards)
+        with pytest.raises(ValidationError):
+            ServicesPolicy(allow_targetless=["notify.tel*"])
 
 
 # ---------------------------------------------------------------------------

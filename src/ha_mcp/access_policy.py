@@ -22,6 +22,7 @@ import asyncio
 import contextvars
 import fnmatch
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -106,6 +107,36 @@ class ToolsPolicy(BaseModel):
     disabled_tags: list[str] = Field(default_factory=list)
 
 
+_SERVICE_SPEC_RE = re.compile(r"^[a-z0-9_]+\.([a-z0-9_]+|\*)$")
+
+
+class ServicesPolicy(BaseModel):
+    """Service-call policy.
+
+    Targetless service calls (no ``entity_id``/``target``) cannot be gated
+    per-entity, so they are denied by default under a policy. List entries
+    here to allow specific ones.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # "domain.service" strings (e.g. "persistent_notification.create") or
+    # "domain.*" to allow every service in a domain. Entries are matched
+    # case-sensitively against the lowercase domain.service of each call.
+    allow_targetless: list[str] = Field(default_factory=list)
+
+    @field_validator("allow_targetless")
+    @classmethod
+    def _check_service_specs(cls, v: list[str]) -> list[str]:
+        bad = [s for s in v if not _SERVICE_SPEC_RE.match(s)]
+        if bad:
+            raise ValueError(
+                "services.allow_targetless entries must be 'domain.service' or "
+                f"'domain.*' (lowercase), got invalid: {bad}"
+            )
+        return v
+
+
 class PolicyConfig(BaseModel):
     """Top-level policy schema mirroring the YAML file."""
 
@@ -119,6 +150,7 @@ class PolicyConfig(BaseModel):
     readonly_mode: bool = False
     tools: ToolsPolicy = Field(default_factory=ToolsPolicy)
     entities: EntitiesPolicy = Field(default_factory=EntitiesPolicy)
+    services: ServicesPolicy = Field(default_factory=ServicesPolicy)
 
     @field_validator("version")
     @classmethod
@@ -382,6 +414,14 @@ class AccessPolicy:
         self.cache = cache
         self._disabled_names = set(cfg.tools.disabled_names)
         self._disabled_tags = set(cfg.tools.disabled_tags)
+        # Pre-split allow_targetless into exact and wildcard sets for O(1) match.
+        self._targetless_exact: set[str] = set()
+        self._targetless_wildcards: set[str] = set()  # domains with ``.*``
+        for entry in cfg.services.allow_targetless:
+            if entry.endswith(".*"):
+                self._targetless_wildcards.add(entry[:-2])
+            else:
+                self._targetless_exact.add(entry)
 
     # -- Tool gating --------------------------------------------------------
 
@@ -396,6 +436,21 @@ class AccessPolicy:
         if tags and (tags & self._disabled_tags):
             return False
         return not (self.cfg.readonly_mode and _is_write_tool(annotations))
+
+    # -- Service-call gating ------------------------------------------------
+
+    def allows_targetless_service(self, domain: str, service: str) -> bool:
+        """Return True if ``domain.service`` is in the targetless allow-list.
+
+        Matches exact ``domain.service`` entries and ``domain.*`` wildcards.
+        Readonly policies deny every targetless call regardless of this list.
+        """
+        if self.cfg.readonly_mode:
+            return False
+        return (
+            f"{domain}.{service}" in self._targetless_exact
+            or domain in self._targetless_wildcards
+        )
 
     # -- Entity gating ------------------------------------------------------
 
