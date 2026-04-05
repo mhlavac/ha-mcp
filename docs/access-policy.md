@@ -270,25 +270,30 @@ isolation:
 
 1. **Client layer (automatic):** The policy gates every call through
    `get_states`, `get_entity_state`, `set_entity_state`, `call_service`,
-   and WebSocket `entity_registry/*` + `device_registry/list` responses.
-   This covers the bulk of MCP tools — search, state reads, service calls,
-   automations, scripts, helpers, etc.
+   and the logbook REST endpoint, plus WebSocket responses from
+   `entity_registry/*`, `device_registry/list`, `homeassistant/expose_entity/list`,
+   and `zone/list`. Entity-scoped WS commands (`todo/item/*`,
+   `homeassistant/expose_entity`) are pre-gated before dispatch. This
+   covers the bulk of MCP tools — search, state reads, service calls,
+   automations, scripts, helpers, todo lists, voice-assistant exposure,
+   etc.
 
-2. **Tool layer (you configure):** Some tools reach Home Assistant through
-   paths the client layer doesn't cover. For those, you must use
-   `tools.disabled_tags` or `tools.disabled_names` to block the *tool*
-   entirely. Known v1 bypasses:
+2. **Tool layer (automatic for known bypasses):** Some tools reach Home
+   Assistant through code paths the client layer doesn't cover (direct
+   httpx, direct `_request`, direct `ws_client`). Those tools now carry
+   their own per-entity gate or are hard-disabled under an active policy:
 
-   | Path | Tools | Mitigation |
+   | Path | Tools | Status |
    |---|---|---|
-   | WS `history/*` & `recorder/statistics_*` | `ha_get_history`, `ha_get_statistics` | `disabled_tags: ["History & Statistics"]` |
-   | Jinja templates | `ha_eval_template` | `disabled_names: [ha_eval_template]` |
-   | Direct httpx (camera images) | `ha_get_camera_snapshot` etc. | `disabled_tags: ["Camera"]` |
-   | Unfiltered REST (calendar) | calendar tools | `disabled_tags: ["Calendar"]` |
-   | Integration config dump | `ha_list_integrations` etc. | `disabled_tags: ["Integrations"]` |
+   | WS `history/*` & `recorder/statistics_*` | `ha_get_history`, `ha_get_statistics` | Gated per-entity at tool layer — deny whole call if ANY requested entity is outside scope |
+   | Jinja templates | `ha_eval_template` | Hard-disabled under any active policy (Jinja reads any state via `states('lock.front')`) — add to `tools.disabled_names` to pre-empt the runtime denial |
+   | Direct httpx (camera images) | `ha_get_camera_image` | Gated per-entity at tool layer |
+   | Unfiltered REST (calendar) | `ha_config_get_calendar_events` | Gated per-entity at tool layer (write tools already flow through the service-call gate) |
+   | Integration config dump | `ha_get_integration` | Hard-disabled under any active policy (config entries expose OAuth tokens and provider credentials) — add to `tools.disabled_names` to pre-empt the runtime denial |
 
-   These are tracked for tightening in a follow-up. For now, disabling
-   the tools is the supported defense.
+   For the hard-disabled tools, the kid preset still recommends listing
+   them under `tools.disabled_names` so the tool never shows up in the
+   agent's tool list in the first place.
 
 **Principle: least privilege via both layers.** If a tool category isn't
 explicitly gated at the entity level and you aren't sure what it can reach,

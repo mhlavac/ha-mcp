@@ -12,7 +12,7 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -633,7 +633,7 @@ class RecordingClient:
 class TestCacheTTL:
     # Each _refresh() issues 3 WS calls (entity_registry, device_registry,
     # label_registry). The empty-registry sentinel used across these tests:
-    _EMPTY = {"success": True, "result": []}
+    _EMPTY: ClassVar[dict[str, Any]] = {"success": True, "result": []}
 
     async def test_invalidate_forces_refresh(self):
         """invalidate() sets _fetched_at back to 0, so next ensure_fresh refetches."""

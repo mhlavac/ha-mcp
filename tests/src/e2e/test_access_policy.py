@@ -25,11 +25,11 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 
-from ha_mcp.client import HomeAssistantClient
-from ha_mcp.server import HomeAssistantSmartMCPServer
-
 # Import test token (test_constants is on sys.path via conftest.py)
 from test_constants import TEST_TOKEN
+
+from ha_mcp.client import HomeAssistantClient
+from ha_mcp.server import HomeAssistantSmartMCPServer
 
 from .utilities.assertions import (
     assert_mcp_success,
@@ -496,6 +496,251 @@ class TestAccessPolicy:
 
 
 @pytest.mark.asyncio
+class TestAccessPolicyBypassFixes:
+    """Tests for bypass paths closed in commits 876dacd and 56ab12d.
+
+    Covers gates added to the client layer (logbook REST endpoint, entity-
+    scoped WS commands) and the tool layer (history/statistics, camera
+    snapshots, calendar reads, hard-disabled template/integration tools).
+    """
+
+    # ---- Client layer: logbook REST endpoint (commit 876dacd) ------------
+
+    async def test_policy_denies_logbook_for_forbidden_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_logs(source='logbook', entity_id=<bob's>) is denied."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_logs",
+            {
+                "source": "logbook",
+                "entity_id": "input_boolean.bob_toy",
+                "hours_back": 1,
+            },
+        )
+
+        assert _is_access_denied(data), (
+            f"Logbook read for forbidden entity should be ACCESS_DENIED, got {data}"
+        )
+
+    async def test_policy_denies_logbook_without_entity_filter(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_logs(source='logbook') with no entity_id is denied under policy."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_logs",
+            {"source": "logbook", "hours_back": 1},
+        )
+
+        assert _is_access_denied(data), (
+            f"Unfiltered logbook read should be ACCESS_DENIED, got {data}"
+        )
+        err = data.get("error") or {}
+        details = (err.get("details") or "") if isinstance(err, dict) else ""
+        assert "entity_id" in details.lower(), (
+            f"Denial should mention entity_id filter requirement, got details={details!r}"
+        )
+
+    async def test_policy_allows_logbook_for_owned_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_logs(source='logbook', entity_id=<alice's>) succeeds."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        result = await client.mcp.call_tool(
+            "ha_get_logs",
+            {
+                "source": "logbook",
+                "entity_id": "input_boolean.alice_toy",
+                "hours_back": 1,
+            },
+        )
+        data = parse_mcp_result(result)
+        # Response is wrapped: {"data": {...}, "metadata": {...}} by
+        # add_timezone_metadata. Inner dict has success=True.
+        inner = data.get("data") if isinstance(data.get("data"), dict) else data
+        assert inner.get("success") is True, (
+            f"Logbook for owned entity should succeed, got {data}"
+        )
+
+    async def test_policy_filters_expose_entity_list(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_entity_exposure listing must not leak bob/parents entities.
+
+        The `homeassistant/expose_entity/list` WS response is filtered by
+        _apply_policy_to_ws_response so denied entity_ids are dropped from
+        the exposed_entities map. A fresh HA container typically has no
+        custom exposures, so we only assert that denied entities are absent
+        (not that any particular entity is present).
+        """
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        result = await client.mcp.call_tool("ha_get_entity_exposure", {})
+        data = parse_mcp_result(result)
+        assert data.get("success") is True, (
+            f"expose_entity listing should succeed, got {data}"
+        )
+        exposed_entities = data.get("exposed_entities") or {}
+        assert "input_boolean.bob_toy" not in exposed_entities, (
+            f"bob_toy must be filtered out of exposed_entities, got {list(exposed_entities)}"
+        )
+        assert "input_boolean.parent_safe" not in exposed_entities, (
+            f"parent_safe must be filtered out of exposed_entities, got {list(exposed_entities)}"
+        )
+
+    # ---- Tool layer: history & statistics (commit 56ab12d) ---------------
+
+    async def test_policy_denies_get_history_for_forbidden_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_history for bob's entity is denied."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_history",
+            {"entity_ids": "input_boolean.bob_toy"},
+        )
+
+        assert _is_access_denied(data), (
+            f"ha_get_history for forbidden entity should be ACCESS_DENIED, got {data}"
+        )
+
+    async def test_policy_denies_get_history_mixed_allowed_denied(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_history denies the whole call when ANY entity is forbidden."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_history",
+            {"entity_ids": "input_boolean.alice_toy,input_boolean.bob_toy"},
+        )
+
+        assert _is_access_denied(data), (
+            f"Mixed allowed+denied history query should fail whole call, got {data}"
+        )
+
+    async def test_policy_allows_get_history_for_owned_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_history for alice's entity is not denied (HA may return empty)."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_history",
+            {"entity_ids": "input_boolean.alice_toy"},
+        )
+
+        assert not _is_access_denied(data), (
+            f"ha_get_history for owned entity should NOT be ACCESS_DENIED, got {data}"
+        )
+
+    async def test_policy_denies_get_statistics_for_forbidden_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_statistics for bob's entity is denied."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_statistics",
+            {"entity_ids": "input_boolean.bob_toy"},
+        )
+
+        assert _is_access_denied(data), (
+            f"ha_get_statistics for forbidden entity should be ACCESS_DENIED, got {data}"
+        )
+
+    # ---- Tool layer: camera & calendar (commit 56ab12d) ------------------
+
+    async def test_policy_denies_camera_snapshot_for_forbidden_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_camera_image for an entity outside scope is denied.
+
+        Uses a fabricated entity_id; under default_action=deny it will be
+        denied before the camera_proxy HTTP call is even attempted.
+        """
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_get_camera_image",
+            {"entity_id": "camera.bob_cam"},
+        )
+
+        assert _is_access_denied(data), (
+            f"ha_get_camera_image for forbidden entity should be ACCESS_DENIED, got {data}"
+        )
+
+    async def test_policy_denies_calendar_read_for_forbidden_entity(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_config_get_calendar_events for a denied calendar entity is blocked."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_config_get_calendar_events",
+            {"entity_id": "calendar.bob"},
+        )
+
+        assert _is_access_denied(data), (
+            f"Calendar read for forbidden entity should be ACCESS_DENIED, got {data}"
+        )
+
+    # ---- Tool layer: hard-disabled tools (commit 56ab12d) ----------------
+
+    async def test_policy_hard_disables_eval_template(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_eval_template is refused under any active policy."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_eval_template",
+            {"template": "{{ states('light.anything') }}"},
+        )
+
+        assert _is_access_denied(data), (
+            f"ha_eval_template should be hard-disabled under policy, got {data}"
+        )
+        err = data.get("error") or {}
+        details = (err.get("details") or "") if isinstance(err, dict) else ""
+        assert "disabled_names" in details.lower(), (
+            f"Denial should point to tools.disabled_names, got details={details!r}"
+        )
+
+    async def test_policy_hard_disables_get_integration(
+        self, policy_mcp_client
+    ) -> None:
+        """ha_get_integration is refused under any active policy."""
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(client.mcp, "ha_get_integration", {})
+
+        assert _is_access_denied(data), (
+            f"ha_get_integration should be hard-disabled under policy, got {data}"
+        )
+        err = data.get("error") or {}
+        details = (err.get("details") or "") if isinstance(err, dict) else ""
+        assert "disabled_names" in details.lower(), (
+            f"Denial should point to tools.disabled_names, got details={details!r}"
+        )
+
+
+@pytest.mark.asyncio
 class TestAccessPolicyBackwardCompat:
     """Verify server behavior is unchanged when no policy file is set."""
 
@@ -541,4 +786,44 @@ class TestAccessPolicyBackwardCompat:
         )
         assert_mcp_success(
             toggle_result, "toggle bob_toy without policy (backward compat)"
+        )
+
+    async def test_no_policy_allows_new_gated_tools(
+        self, policy_mcp_client
+    ) -> None:
+        """New bypass-fix gates are no-ops when no policy is active.
+
+        Covers the tools gated in commits 876dacd and 56ab12d —
+        require_can_read / require_policy_disabled must be no-ops when
+        client.policy is None, so all gates pass through cleanly.
+        """
+        client = await policy_mcp_client(None)
+
+        # ha_get_history: passes for any entity when no policy active
+        history_data = await safe_call_tool(
+            client.mcp,
+            "ha_get_history",
+            {"entity_ids": "input_boolean.bob_toy"},
+        )
+        assert not _is_access_denied(history_data), (
+            f"ha_get_history must NOT be ACCESS_DENIED without a policy, got {history_data}"
+        )
+
+        # ha_eval_template: hard-disable gate is a no-op without a policy
+        tmpl_data = await safe_call_tool(
+            client.mcp,
+            "ha_eval_template",
+            {"template": "{{ 1 + 1 }}"},
+        )
+        assert not _is_access_denied(tmpl_data), (
+            f"ha_eval_template must NOT be ACCESS_DENIED without a policy, got {tmpl_data}"
+        )
+
+        # ha_get_integration: hard-disable gate is a no-op without a policy
+        integration_data = await safe_call_tool(
+            client.mcp, "ha_get_integration", {}
+        )
+        assert not _is_access_denied(integration_data), (
+            f"ha_get_integration must NOT be ACCESS_DENIED without a policy, "
+            f"got {integration_data}"
         )
