@@ -23,7 +23,7 @@ import contextvars
 import fnmatch
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -140,15 +140,11 @@ class PolicyConfig(BaseModel):
 class EntityMeta:
     """Resolved metadata for a single entity.
 
-    `area_id` and `labels` already include the entity→device fallback, matching
-    HA's own resolution model:
-      - area_id = entity.area_id OR device.area_id
-      - labels  = union(entity.labels, device.labels)
-
-    `labels` contains BOTH the label IDs (slugs, as HA stores them on entities)
-    AND their resolved human names (from the label registry). A rule like
-    ``labels: ["owner:alice"]`` matches a label with ID ``owner_alice`` and
-    name ``owner:alice`` — whichever spelling the user writes.
+    ``area_id`` and ``labels`` include HA's entity→device fallback:
+    ``area_id = entity.area_id OR device.area_id``, and
+    ``labels = union(entity.labels, device.labels)``. The ``labels`` set
+    also includes resolved human names from the label registry (see
+    EntityMetadataCache for details).
     """
 
     entity_id: str
@@ -157,16 +153,95 @@ class EntityMeta:
     device_id: str | None = None
 
 
+def _reduce_label_registry(result: Any) -> dict[str, str]:
+    """Extract ``label_id -> name`` from a ``label_registry/list`` response."""
+    if isinstance(result, Exception):
+        logger.warning("label_registry fetch failed: %s", result)
+        return {}
+    if not (isinstance(result, dict) and result.get("success")):
+        return {}
+    out: dict[str, str] = {}
+    for lbl in result.get("result", []):
+        lid, lname = lbl.get("label_id"), lbl.get("name")
+        if lid and lname:
+            out[lid] = lname
+    return out
+
+
+def _label_expander(
+    label_id_to_name: dict[str, str],
+) -> Callable[[Iterable[str]], set[str]]:
+    """Build a closure that expands label IDs to ``IDs | resolved names``."""
+    def expand(label_ids: Iterable[str]) -> set[str]:
+        ids = set(label_ids)
+        return ids | {label_id_to_name[lid] for lid in ids if lid in label_id_to_name}
+    return expand
+
+
+def _reduce_device_registry(
+    result: Any, expand_labels: Callable[[Iterable[str]], set[str]]
+) -> dict[str, tuple[str | None, set[str]]]:
+    """Extract ``device_id -> (area_id, expanded_labels)`` from the response."""
+    if isinstance(result, Exception):
+        logger.warning("device_registry fetch failed: %s", result)
+        return {}
+    if not (isinstance(result, dict) and result.get("success")):
+        return {}
+    out: dict[str, tuple[str | None, set[str]]] = {}
+    for device in result.get("result", []):
+        dev_id = device.get("id")
+        if dev_id:
+            out[dev_id] = (
+                device.get("area_id"),
+                expand_labels(device.get("labels") or []),
+            )
+    return out
+
+
+def _reduce_entity_registry(
+    result: Any,
+    device_info: dict[str, tuple[str | None, set[str]]],
+    expand_labels: Callable[[Iterable[str]], set[str]],
+) -> tuple[dict[str, EntityMeta], bool]:
+    """Build the entity metadata map, applying entity→device fallback.
+
+    Returns ``(entities, ok)`` where ``ok`` is False on fetch failure so the
+    caller can keep the previous cache snapshot.
+    """
+    if isinstance(result, Exception):
+        return {}, False
+    if not (isinstance(result, dict) and result.get("success")):
+        return {}, True
+    entities: dict[str, EntityMeta] = {}
+    for entry in result.get("result", []):
+        entity_id = entry.get("entity_id")
+        if not entity_id:
+            continue
+        device_id = entry.get("device_id")
+        dev_area, dev_labels = device_info.get(device_id, (None, set()))
+        entities[entity_id] = EntityMeta(
+            entity_id=entity_id,
+            area_id=entry.get("area_id") or dev_area,
+            labels=expand_labels(entry.get("labels") or []) | dev_labels,
+            device_id=device_id,
+        )
+    return entities, True
+
+
 class EntityMetadataCache:
     """TTL-refreshed cache of entity metadata for policy evaluation.
 
-    Fetches entity_registry + device_registry in parallel (pattern from
-    smart_search.py:208-255) and precomputes entity→device fallback
-    (smart_search.py:291-300).
+    Fetches entity/device/label registries in parallel and precomputes the
+    entity→device fallback for ``area_id`` and ``labels``.
 
-    Thread-safety: refreshes are serialized via an asyncio.Lock so concurrent
-    callers wait for a single in-flight refresh rather than stampeding the
-    registries.
+    Labels union: HA stores label IDs (slugs like ``owner_alice``) on
+    entities/devices, but users naturally write rules using label NAMES
+    (``"owner:alice"``). The cache expands each entity's label set to the
+    union of IDs and their resolved names so rules match either spelling.
+
+    Thread-safety: refreshes are serialized via an ``asyncio.Lock`` so
+    concurrent callers wait for a single in-flight refresh rather than
+    stampeding the registries.
     """
 
     DEFAULT_TTL = 60.0  # seconds
@@ -196,101 +271,76 @@ class EntityMetadataCache:
         into ``can_read_batch`` while the refresh lock is still held
         (deadlock).
         """
-        bypass_token = bypass_policy_filter.set(True)
-        try:
-            entity_reg_task = self._client.send_websocket_message(
-                {"type": "config/entity_registry/list"}
-            )
-            device_reg_task = self._client.send_websocket_message(
-                {"type": "config/device_registry/list"}
-            )
-            label_reg_task = self._client.send_websocket_message(
-                {"type": "config/label_registry/list"}
-            )
-            results = await asyncio.gather(
-                entity_reg_task,
-                device_reg_task,
-                label_reg_task,
-                return_exceptions=True,
-            )
-        finally:
-            bypass_policy_filter.reset(bypass_token)
+        entity_result, device_result, label_result = await self._fetch_registries()
 
-        # label_id -> name. HA stores label IDs (slugs like "owner_alice") on
-        # entities/devices, but users naturally write policy rules using label
-        # NAMES ("owner:alice"). We expand meta.labels to include both IDs and
-        # names so rules can reference labels by either spelling.
-        label_id_to_name: dict[str, str] = {}
-        if isinstance(results[2], dict) and results[2].get("success"):
-            for lbl in results[2].get("result", []):
-                lid = lbl.get("label_id")
-                lname = lbl.get("name")
-                if lid and lname:
-                    label_id_to_name[lid] = lname
-        elif isinstance(results[2], Exception):
-            logger.warning("label_registry fetch failed: %s", results[2])
+        label_id_to_name = _reduce_label_registry(label_result)
+        expand = _label_expander(label_id_to_name)
+        device_info = _reduce_device_registry(device_result, expand)
+        entities, entity_ok = _reduce_entity_registry(entity_result, device_info, expand)
 
-        def _expand_labels(label_ids: Iterable[str]) -> set[str]:
-            """Return the union of label IDs and their resolved names."""
-            ids = set(label_ids)
-            names = {label_id_to_name[lid] for lid in ids if lid in label_id_to_name}
-            return ids | names
-
-        # device_id -> (area_id, labels set — with names expanded)
-        device_info: dict[str, tuple[str | None, set[str]]] = {}
-        if isinstance(results[1], dict) and results[1].get("success"):
-            for device in results[1].get("result", []):
-                dev_id = device.get("id")
-                if dev_id:
-                    device_info[dev_id] = (
-                        device.get("area_id"),
-                        _expand_labels(device.get("labels") or []),
-                    )
-        elif isinstance(results[1], Exception):
-            logger.warning("device_registry fetch failed: %s", results[1])
-
-        entities: dict[str, EntityMeta] = {}
-        if isinstance(results[0], dict) and results[0].get("success"):
-            for entry in results[0].get("result", []):
-                entity_id = entry.get("entity_id")
-                if not entity_id:
-                    continue
-                entity_area = entry.get("area_id")
-                entity_labels = _expand_labels(entry.get("labels") or [])
-                device_id = entry.get("device_id")
-
-                # Fallback to device metadata
-                dev_area, dev_labels = device_info.get(device_id, (None, set()))
-                resolved_area = entity_area or dev_area
-                resolved_labels = entity_labels | dev_labels
-
-                entities[entity_id] = EntityMeta(
-                    entity_id=entity_id,
-                    area_id=resolved_area,
-                    labels=resolved_labels,
-                    device_id=device_id,
-                )
         # Always update _fetched_at so a transient failure doesn't leave the
-        # cache permanently "expired" (which would stampede every can_read call)
-        # nor permanently "fresh" (which would hide newly-created entities).
+        # cache permanently "expired" (stampede) nor permanently "fresh"
+        # (hiding newly-created entities).
         self._fetched_at = time.monotonic()
 
-        if isinstance(results[0], Exception):
+        if not entity_ok:
             logger.warning(
                 "entity_registry fetch failed, keeping previous cache: %s",
-                results[0],
+                entity_result,
             )
             return
 
         self._entities = entities
         logger.debug("AccessPolicy metadata cache refreshed: %d entities", len(entities))
 
-    def _lookup(self, entity_id: str) -> EntityMeta:
+    async def _fetch_registries(self) -> tuple[Any, Any, Any]:
+        """Fetch entity/device/label registries in parallel with filter bypass."""
+        bypass_token = bypass_policy_filter.set(True)
+        try:
+            results = await asyncio.gather(
+                self._client.send_websocket_message(
+                    {"type": "config/entity_registry/list"}
+                ),
+                self._client.send_websocket_message(
+                    {"type": "config/device_registry/list"}
+                ),
+                self._client.send_websocket_message(
+                    {"type": "config/label_registry/list"}
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            bypass_policy_filter.reset(bypass_token)
+        entity_result, device_result, label_result = results
+        return entity_result, device_result, label_result
+
+    def iter_entities(self) -> Iterable[EntityMeta]:
+        """Iterate the current snapshot of cached entity metadata.
+
+        Stable during a single call because ``_refresh`` assigns a new dict
+        atomically. Freshness is the caller's responsibility — call
+        ``ensure_fresh()`` first if needed.
+        """
+        return self._entities.values()
+
+    def entities_by_device(self) -> dict[str, list[str]]:
+        """Group the current snapshot by ``device_id``.
+
+        Entities without a device are omitted. No freshness guarantee —
+        callers must ``ensure_fresh()`` first if they need current data.
+        """
+        grouped: dict[str, list[str]] = {}
+        for meta in self._entities.values():
+            if meta.device_id:
+                grouped.setdefault(meta.device_id, []).append(meta.entity_id)
+        return grouped
+
+    def lookup(self, entity_id: str) -> EntityMeta:
         """In-memory lookup from the current snapshot (no freshness guarantee).
 
-        Returns an empty EntityMeta for unknown entities so rule matching can
-        run uniformly. Internal — AccessPolicy uses this after a single
-        ensure_fresh() when evaluating many entities.
+        Returns an empty ``EntityMeta`` for unknown entities so rule matching
+        can run uniformly. Callers that need a fresh cache should call
+        ``ensure_fresh()`` first (see ``get()`` for the combined form).
         """
         meta = self._entities.get(entity_id)
         if meta is None:
@@ -300,7 +350,7 @@ class EntityMetadataCache:
     async def get(self, entity_id: str) -> EntityMeta:
         """Ensure cache is fresh, then return entity metadata."""
         await self.ensure_fresh()
-        return self._lookup(entity_id)
+        return self.lookup(entity_id)
 
     def invalidate(self) -> None:
         """Force a refresh on the next access (e.g. in response to a WS event)."""
@@ -373,14 +423,14 @@ class AccessPolicy:
         await self.cache.ensure_fresh()
         return [
             eid for eid in entity_ids
-            if self._check_read(eid, self.cache._lookup(eid))
+            if self._check_read(eid, self.cache.lookup(eid))
         ]
 
     async def can_read_batch(self, entity_ids: Iterable[str]) -> dict[str, bool]:
         """Map each entity_id to a read decision. Single cache refresh for the batch."""
         await self.cache.ensure_fresh()
         return {
-            eid: self._check_read(eid, self.cache._lookup(eid))
+            eid: self._check_read(eid, self.cache.lookup(eid))
             for eid in entity_ids
         }
 
@@ -402,7 +452,7 @@ class AccessPolicy:
             return set()
         await self.cache.ensure_fresh()
         result: set[str] = set()
-        for meta in self.cache._entities.values():
+        for meta in self.cache.iter_entities():
             if (
                 (devs and meta.device_id in devs)
                 or (areas and meta.area_id in areas)
@@ -427,24 +477,21 @@ class AccessPolicy:
     def _matches_any(
         self, rules: list[EntityRule], entity_id: str, meta: EntityMeta
     ) -> bool:
-        return any(self._rule_matches(rule, entity_id, meta) for rule in rules)
+        return any(_rule_matches(rule, entity_id, meta) for rule in rules)
 
-    @staticmethod
-    def _rule_matches(rule: EntityRule, entity_id: str, meta: EntityMeta) -> bool:
-        # areas: match only when entity has a resolved area
-        if rule.areas and meta.area_id and meta.area_id in rule.areas:
+
+def _rule_matches(rule: EntityRule, entity_id: str, meta: EntityMeta) -> bool:
+    """Evaluate a single rule against an entity. Primitives OR together."""
+    if rule.areas and meta.area_id and meta.area_id in rule.areas:
+        return True
+    if rule.labels and meta.labels and meta.labels.intersection(rule.labels):
+        return True
+    for pattern in rule.entity_globs:
+        if fnmatch.fnmatchcase(entity_id, pattern):
             return True
-        # labels: intersection (entity has any label named in the rule)
-        if rule.labels and meta.labels and meta.labels.intersection(rule.labels):
-            return True
-        # entity_globs: fnmatch against the entity_id
-        for pattern in rule.entity_globs:
-            if fnmatch.fnmatchcase(entity_id, pattern):
-                return True
-        # device_ids: direct membership
-        return bool(
-            rule.device_ids and meta.device_id and meta.device_id in rule.device_ids
-        )
+    return bool(
+        rule.device_ids and meta.device_id and meta.device_id in rule.device_ids
+    )
 
 
 # ---------------------------------------------------------------------------

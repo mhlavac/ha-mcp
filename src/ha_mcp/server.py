@@ -123,19 +123,13 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
             return None
 
         cfg = load_policy_from_file(policy_path)
-
-        # Ensure the lazy-initialized client carries the policy. When a client
-        # was injected we retrofit the policy onto it.
-        if self._client is None:
-            from .client.rest_client import HomeAssistantClient
-            client_for_cache = HomeAssistantClient()
-            self._client = client_for_cache
-        else:
-            client_for_cache = self._client
-
-        cache = EntityMetadataCache(client_for_cache)
+        # The cache needs a client, but tool registration happens before the
+        # client is lazily constructed. Access self.client here so the policy
+        # and the client share the same instance — for an injected client we
+        # retrofit the policy attribute in place.
+        cache = EntityMetadataCache(self.client)
         policy = AccessPolicy(cfg, cache)
-        client_for_cache.policy = policy
+        self.client.policy = policy
         set_global_policy(policy)
         logger.info("Loaded access policy from %s", policy_path)
         return policy

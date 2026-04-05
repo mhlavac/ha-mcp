@@ -5,14 +5,13 @@ Home Assistant HTTP client with authentication and error handling.
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
-from fastmcp.exceptions import ToolError
 
 from ..access_policy import bypass_policy_filter
 from ..config import get_global_settings
-from ..errors import create_access_denied_error
+from ..errors import create_access_denied_error, raise_tool_error
 
 if TYPE_CHECKING:
     from ..access_policy import AccessPolicy
@@ -20,15 +19,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _deny(entity_id: str, operation: str, reason: str | None = None) -> ToolError:
-    """Construct a ToolError carrying an ACCESS_DENIED structured payload."""
-    return ToolError(
-        json.dumps(
-            create_access_denied_error(entity_id, operation=operation, reason=reason),
-            indent=2,
-            default=str,
-        )
+def _deny(entity_id: str, operation: str, reason: str | None = None) -> NoReturn:
+    """Raise a ToolError carrying an ACCESS_DENIED structured payload."""
+    raise_tool_error(
+        create_access_denied_error(entity_id, operation=operation, reason=reason)
     )
+
+
+def _as_str_list(value: Any) -> list[str]:
+    """Coerce a scalar / list / None value to a list of strings.
+
+    HA accepts service-call target fields as either a scalar or a list; this
+    normalizes both shapes for policy enforcement.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    return [str(value)]
 
 
 class HomeAssistantError(Exception):
@@ -205,7 +213,7 @@ class HomeAssistantClient:
             Entity state data
         """
         if self.policy is not None and not await self.policy.can_read(entity_id):
-            raise _deny(entity_id, operation="read")
+            _deny(entity_id, operation="read")
         logger.debug(f"Fetching state for entity: {entity_id}")
         return await self._request("GET", f"/states/{entity_id}")
 
@@ -224,7 +232,7 @@ class HomeAssistantClient:
             Updated entity state
         """
         if self.policy is not None and not await self.policy.can_write(entity_id):
-            raise _deny(entity_id, operation="write")
+            _deny(entity_id, operation="write")
         logger.debug(f"Setting state for entity {entity_id} to {state}")
 
         payload: dict[str, Any] = {"state": state}
@@ -290,68 +298,54 @@ class HomeAssistantClient:
         not writable, or if expansion of a target yields zero entities.
         """
         assert self.policy is not None  # narrowed by caller
-
-        def _as_list(v: Any) -> list[str]:
-            if v is None:
-                return []
-            if isinstance(v, list):
-                return [str(x) for x in v]
-            return [str(v)]
+        op = f"call_service:{domain}.{service}"
 
         target = payload.get("target") or {}
         if not isinstance(target, dict):
             target = {}
 
-        # Direct entity_ids from both locations
         entity_ids: set[str] = set()
-        entity_ids.update(_as_list(payload.get("entity_id")))
-        entity_ids.update(_as_list(target.get("entity_id")))
+        entity_ids.update(_as_str_list(payload.get("entity_id")))
+        entity_ids.update(_as_str_list(target.get("entity_id")))
 
         # HA accepts entity_id="all" as a wildcard affecting every entity of a
         # domain. That cannot be reconciled with per-entity policy, so deny it
         # outright regardless of default_action (which would otherwise treat
         # "all" as an unknown entity and let it pass under default_action=allow).
         if "all" in entity_ids:
-            raise _deny(
+            _deny(
                 "all",
-                operation=f"call_service:{domain}.{service}",
+                operation=op,
                 reason="entity_id wildcard 'all' is not permitted under a policy",
             )
 
-        # Indirect targets: expand via the policy's public target resolver.
-        device_ids = set(_as_list(target.get("device_id")))
-        area_ids = set(_as_list(target.get("area_id")))
-        label_ids = set(_as_list(target.get("label_id")))
-        had_indirect = bool(device_ids or area_ids or label_ids)
-        if had_indirect:
+        device_ids = set(_as_str_list(target.get("device_id")))
+        area_ids = set(_as_str_list(target.get("area_id")))
+        label_ids = set(_as_str_list(target.get("label_id")))
+        if device_ids or area_ids or label_ids:
             expanded = await self.policy.expand_targets(
                 device_ids=device_ids, area_ids=area_ids, label_ids=label_ids
             )
             entity_ids.update(expanded)
-            # If indirect targets were specified but nothing matched, deny.
             if not entity_ids:
-                target_desc = (
-                    f"device_id={sorted(device_ids)}, "
-                    f"area_id={sorted(area_ids)}, "
-                    f"label_id={sorted(label_ids)}"
-                )
-                raise _deny(
-                    target_desc,
-                    operation=f"call_service:{domain}.{service}",
+                _deny(
+                    (
+                        f"device_id={sorted(device_ids)}, "
+                        f"area_id={sorted(area_ids)}, "
+                        f"label_id={sorted(label_ids)}"
+                    ),
+                    operation=op,
                     reason="Target expanded to zero accessible entities",
                 )
 
-        # If no entities at all, nothing to gate (targetless service call).
+        # Targetless service calls (e.g. ``homeassistant.check_config``) are
+        # not gated — nothing to evaluate per-entity.
         if not entity_ids:
             return
 
-        # Every touched entity must be writable.
         for eid in sorted(entity_ids):
             if not await self.policy.can_write(eid):
-                raise _deny(
-                    eid,
-                    operation=f"call_service:{domain}.{service}",
-                )
+                _deny(eid, operation=op)
 
     async def get_services(self) -> dict[str, Any]:
         """Get all available services."""
@@ -928,14 +922,7 @@ class HomeAssistantClient:
                 command_type = message_copy.pop("type")
                 result = await ws_client.send_command(command_type, **message_copy)
 
-                # Policy filtering of registry responses (skipped while the
-                # policy's own cache is refreshing — see bypass_policy_filter).
-                if (
-                    self.policy is not None
-                    and not bypass_policy_filter.get()
-                    and isinstance(result, dict)
-                    and result.get("success") is not False
-                ):
+                if self._should_filter_ws_response(result):
                     result = await self._apply_policy_to_ws_response(
                         command_type, result
                     )
@@ -971,6 +958,19 @@ class HomeAssistantClient:
                 return {"success": False, "error": str(e)}
 
         return {"success": False, "error": "WebSocket request failed"}
+
+    def _should_filter_ws_response(self, result: Any) -> bool:
+        """Decide whether ``_apply_policy_to_ws_response`` should run.
+
+        Skipped when no policy is active, when the policy cache is refreshing
+        (see ``bypass_policy_filter``), when the response isn't a dict, or
+        when the WS call failed (success=False — nothing to filter).
+        """
+        if self.policy is None or bypass_policy_filter.get():
+            return False
+        if not isinstance(result, dict):
+            return False
+        return result.get("success") is not False
 
     async def _apply_policy_to_ws_response(
         self, command_type: str, result: dict[str, Any]
@@ -1018,34 +1018,24 @@ class HomeAssistantClient:
                 payload = result.get("result")
                 if not isinstance(payload, list):
                     return result
-                # Build device_id -> set of its entity_ids from the policy cache.
-                # Cache is refreshed by the preceding can_read_batch calls in
-                # normal operation, but ensure freshness in case this is the
-                # first call that touches registries.
+                # Ensure freshness in case this is the first call that touches
+                # registries (normally populated by preceding can_read_batch).
                 await self.policy.cache.ensure_fresh()
-                device_entities: dict[str, list[str]] = {}
-                for meta in self.policy.cache._entities.values():
-                    if meta.device_id:
-                        device_entities.setdefault(meta.device_id, []).append(
-                            meta.entity_id
-                        )
-                # Determine which entities are readable in one batch.
+                device_entities = self.policy.cache.entities_by_device()
                 all_eids = {
                     eid for eids in device_entities.values() for eid in eids
                 }
                 readable_map = (
                     await self.policy.can_read_batch(all_eids) if all_eids else {}
                 )
-                filtered_devices = []
-                for dev in payload:
-                    dev_id = dev.get("id")
-                    dev_entities = device_entities.get(dev_id or "", [])
-                    if not dev_entities:
-                        # Device has no registered entities — keep it.
-                        filtered_devices.append(dev)
-                        continue
-                    if any(readable_map.get(eid, False) for eid in dev_entities):
-                        filtered_devices.append(dev)
+                filtered_devices = [
+                    dev
+                    for dev in payload
+                    # Keep devices with no registered entities; otherwise keep
+                    # those with at least one readable entity.
+                    if not (dev_entities := device_entities.get(dev.get("id") or "", []))
+                    or any(readable_map.get(eid, False) for eid in dev_entities)
+                ]
                 return {**result, "result": filtered_devices}
         finally:
             bypass_policy_filter.reset(token)

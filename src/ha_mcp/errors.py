@@ -10,8 +10,11 @@ The structured error format enables AI agents to:
 - Understand the context and details of failures
 """
 
+import json
 from enum import StrEnum
-from typing import Any
+from typing import Any, NoReturn
+
+from fastmcp.exceptions import ToolError
 
 
 class ErrorCode(StrEnum):
@@ -415,6 +418,16 @@ def create_resource_not_found_error(
         details=details,
         context={"resource_type": resource_type, "identifier": identifier},
     )
+
+
+def raise_tool_error(error_response: dict[str, Any]) -> NoReturn:
+    """Raise a ToolError carrying a JSON-serialized structured error payload.
+
+    Lives in ``errors.py`` (not ``tools/helpers.py``) so modules below the
+    ``tools/`` layer (e.g. ``client/rest_client.py``) can use it without
+    creating an import cycle.
+    """
+    raise ToolError(json.dumps(error_response, indent=2, default=str))
 
 
 def is_error_response(response: dict[str, Any]) -> bool:
