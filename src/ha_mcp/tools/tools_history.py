@@ -20,6 +20,7 @@ from typing import Annotated, Any
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
+from ..access_policy import require_can_read
 from ..errors import ErrorCode, create_error_response
 from .helpers import (
     exception_to_structured_error,
@@ -237,6 +238,14 @@ def register_history_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                     "entity_ids is required",
                     suggestions=["Provide at least one entity ID"],
                 ))
+
+            # Access policy: deny the whole call if any requested entity is
+            # outside policy scope. history/history_during_period bypasses the
+            # rest_client WS gate because the tool uses ws_client directly.
+            for eid in entity_id_list:
+                await require_can_read(
+                    client.policy, eid, operation="read:history"
+                )
 
             # Parse time parameters
             try:
@@ -531,6 +540,14 @@ def register_history_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                         "Provide at least one entity ID with state_class attribute"
                     ],
                 ))
+
+            # Access policy: deny the whole call if any requested entity is
+            # outside policy scope. recorder/statistics_during_period bypasses
+            # the rest_client WS gate because the tool uses ws_client directly.
+            for eid in entity_id_list:
+                await require_can_read(
+                    client.policy, eid, operation="read:statistics"
+                )
 
             # Parse time parameters (default 30 days for statistics)
             try:

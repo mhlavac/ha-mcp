@@ -11,6 +11,7 @@ from typing import Annotated, Any
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
+from ..access_policy import require_policy_disabled
 from ..errors import ErrorCode, create_error_response
 from .helpers import exception_to_structured_error, log_tool_usage, raise_tool_error
 from .util_helpers import build_pagination_metadata, coerce_bool_param, coerce_int_param
@@ -114,6 +115,22 @@ def register_integration_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         STATES: 'loaded', 'setup_error', 'setup_retry', 'not_loaded',
         'failed_unload', 'migration_error'.
         """
+        # Access policy: integration config entries contain OAuth tokens,
+        # credentials, and provider-specific secrets for every integration.
+        # These can't be meaningfully filtered per-entity (a token authorizes
+        # access to every entity the integration controls). Disable under a
+        # policy — users who want to pre-empt this runtime denial should add
+        # ha_get_integration to ``tools.disabled_names``.
+        require_policy_disabled(
+            client.policy,
+            "ha_get_integration",
+            reason=(
+                "ha_get_integration returns integration config entries which "
+                "contain OAuth tokens and provider credentials. Add it to "
+                "tools.disabled_names in your policy file."
+            ),
+        )
+
         try:
             include_opts = coerce_bool_param(
                 include_options, "include_options", default=False

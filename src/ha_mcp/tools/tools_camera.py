@@ -10,6 +10,7 @@ from typing import Any
 
 from fastmcp.utilities.types import Image
 
+from ..access_policy import require_can_read
 from .helpers import log_tool_usage
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ def register_camera_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 f"Entity {entity_id} is not a camera entity. "
                 f"Domain is '{domain}', expected 'camera'."
             )
+
+        # Access policy: camera_proxy uses httpx_client directly and bypasses
+        # the rest_client policy gate.
+        await require_can_read(client.policy, entity_id, operation="read:camera_image")
 
         # Build the camera proxy URL with optional size parameters
         # Home Assistant camera proxy API: /api/camera_proxy/<entity_id>

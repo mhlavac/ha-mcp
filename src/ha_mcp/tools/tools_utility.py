@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from fastmcp.exceptions import ToolError
 
+from ..access_policy import require_policy_disabled
 from ..client.rest_client import HomeAssistantAPIError, HomeAssistantConnectionError
 from ..errors import ErrorCode, create_error_response
 from .helpers import exception_to_structured_error, log_tool_usage, raise_tool_error
@@ -749,6 +750,21 @@ def register_utility_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
         **For template documentation:** https://www.home-assistant.io/docs/configuration/templating/
         """
+        # Access policy: Jinja templates can read any entity state via
+        # ``states('lock.front')`` etc, bypassing per-entity gating entirely.
+        # Disable the tool whenever a policy is active — users who want to
+        # pre-empt this runtime denial should add ``ha_eval_template`` to
+        # ``tools.disabled_names``.
+        require_policy_disabled(
+            client.policy,
+            "ha_eval_template",
+            reason=(
+                "ha_eval_template evaluates Jinja templates with unrestricted "
+                "access to entity states. Add it to tools.disabled_names in "
+                "your policy file."
+            ),
+        )
+
         # Coerce boolean parameter that may come as string from XML-style calls
         report_errors_bool = coerce_bool_param(
             report_errors, "report_errors", default=True

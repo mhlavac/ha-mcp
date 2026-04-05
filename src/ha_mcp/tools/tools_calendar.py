@@ -14,6 +14,7 @@ from typing import Annotated, Any
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
+from ..access_policy import require_can_read
 from ..errors import ErrorCode, create_error_response
 from .helpers import exception_to_structured_error, log_tool_usage, raise_tool_error
 
@@ -88,6 +89,10 @@ def register_calendar_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                         "Calendar entity IDs start with 'calendar.' prefix",
                     ],
                 ))
+
+            # Access policy: /calendars/{entity_id} uses client._request directly
+            # and bypasses the rest_client state-read policy gate.
+            await require_can_read(client.policy, entity_id, operation="read:calendar_events")
 
             # Set default time range if not provided
             now = datetime.now()
