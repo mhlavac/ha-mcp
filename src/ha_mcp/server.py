@@ -71,10 +71,10 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
         self._client: HomeAssistantClient | None = client
         self._client_provided = client is not None
 
-        # Load the access policy (if configured) BEFORE tool registration so
-        # the registry can consult it. Any failure to load a configured policy
-        # is fatal (fail-closed).
-        self._policy: AccessPolicy | None = self._load_policy()
+        # Initialize _policy to None first so self.client can be accessed
+        # during _load_policy without AttributeError (circular init guard).
+        self._policy: AccessPolicy | None = None
+        self._policy = self._load_policy()
 
         # Lazy initialization placeholders
         self._smart_tools: Any = None
