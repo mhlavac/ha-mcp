@@ -292,10 +292,21 @@ class HomeAssistantClient:
     ) -> None:
         """Verify every entity implicated by a service call is writable.
 
-        Scans ``payload["entity_id"]`` AND ``payload["target"]`` (entity_id,
-        device_id, area_id, label_id) and expands each indirect target via
-        the metadata cache. Raises ACCESS_DENIED if any touched entity is
-        not writable, or if expansion of a target yields zero entities.
+        Scans EVERY target selector at BOTH the top level of the payload AND
+        under ``payload["target"]`` — entity_id, device_id, area_id, label_id,
+        floor_id — and expands each indirect target via the metadata cache.
+        Raises ACCESS_DENIED if any touched entity is not writable, or if
+        expansion of a target yields zero entities.
+
+        Both levels must be scanned because HA's REST service endpoint treats
+        ``target`` and the top-level service data as ONE namespace
+        (``ServiceRegistry.async_call`` merges ``target`` into the service
+        data), so ``{"entity_id": "...", "area_id": "flur"}`` and
+        ``{"entity_id": "...", "target": {"area_id": "flur"}}`` resolve
+        identically. Reading selectors only from ``target`` (the pre-fix
+        behavior) let a caller pair one allowed entity with a top-level
+        ``area_id``/``floor_id`` and actuate every entity in that area,
+        bypassing the per-entity gate entirely.
         """
         assert self.policy is not None  # narrowed by caller
         op = f"call_service:{domain}.{service}"
@@ -304,9 +315,13 @@ class HomeAssistantClient:
         if not isinstance(target, dict):
             target = {}
 
-        entity_ids: set[str] = set()
-        entity_ids.update(_as_str_list(payload.get("entity_id")))
-        entity_ids.update(_as_str_list(target.get("entity_id")))
+        def _sel(key: str) -> set[str]:
+            """Union a target selector across the top level and ``target``."""
+            return set(_as_str_list(payload.get(key))) | set(
+                _as_str_list(target.get(key))
+            )
+
+        entity_ids: set[str] = _sel("entity_id")
 
         # HA accepts entity_id="all" as a wildcard affecting every entity of a
         # domain. That cannot be reconciled with per-entity policy, so deny it
@@ -319,9 +334,20 @@ class HomeAssistantClient:
                 reason="entity_id wildcard 'all' is not permitted under a policy",
             )
 
-        device_ids = set(_as_str_list(target.get("device_id")))
-        area_ids = set(_as_str_list(target.get("area_id")))
-        label_ids = set(_as_str_list(target.get("label_id")))
+        # floor_id can't be expanded to entities from the metadata cache (it
+        # holds no floor→area mapping), so it cannot be gated per-entity — deny
+        # it outright under a policy, fail-closed. Otherwise a floor target
+        # would silently skip the write check the way area_id used to.
+        if _sel("floor_id"):
+            _deny(
+                "floor_id",
+                operation=op,
+                reason="floor_id targeting is not permitted under a policy",
+            )
+
+        device_ids = _sel("device_id")
+        area_ids = _sel("area_id")
+        label_ids = _sel("label_id")
         if device_ids or area_ids or label_ids:
             expanded = await self.policy.expand_targets(
                 device_ids=device_ids, area_ids=area_ids, label_ids=label_ids

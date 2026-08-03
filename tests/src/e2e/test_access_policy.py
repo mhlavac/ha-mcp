@@ -424,6 +424,71 @@ class TestAccessPolicy:
             f"Nested target.entity_id should still be gated, got {data}"
         )
 
+    async def test_policy_denies_top_level_floor_id(self, policy_mcp_client) -> None:
+        """A top-level floor_id is denied outright, even paired with an owned entity.
+
+        Regression for the selector-scope bypass: HA merges top-level target
+        selectors into the service data, so pairing one allowed entity with a
+        top-level floor_id used to skip the write gate entirely (floor_id was
+        never read). floor_id can't be expanded to entities from the metadata
+        cache, so it must fail closed.
+        """
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_call_service",
+            {
+                "domain": "input_boolean",
+                "service": "toggle",
+                "entity_id": "input_boolean.alice_toy",  # allowed, on its own
+                "data": {"floor_id": "ground_floor"},  # but this must deny
+            },
+        )
+
+        assert _is_access_denied(data), (
+            f"Top-level floor_id must be denied under a policy, got {data}"
+        )
+
+    async def test_policy_denies_top_level_label_target(
+        self, policy_mcp_client
+    ) -> None:
+        """A top-level label_id resolving to a forbidden entity is denied.
+
+        The pre-fix gate read label_id/area_id/device_id only from ``target``,
+        so a top-level ``label_id`` for bob's entities, paired with alice's own
+        allowed entity, slipped through and actuated bob_toy.
+        """
+        client = await policy_mcp_client(_alice_policy_yaml())
+
+        # Resolve owner:bob's registry label_id (the fixture created it).
+        labels = await safe_call_tool(client.mcp, "ha_config_get_label", {})
+        bob_label_id = next(
+            (
+                lbl.get("label_id")
+                for lbl in labels.get("labels", [])
+                if lbl.get("name") == "owner:bob"
+            ),
+            None,
+        )
+        assert bob_label_id, f"owner:bob label must exist, got {labels}"
+
+        data = await safe_call_tool(
+            client.mcp,
+            "ha_call_service",
+            {
+                "domain": "input_boolean",
+                "service": "toggle",
+                "entity_id": "input_boolean.alice_toy",  # allowed
+                "data": {"label_id": bob_label_id},  # expands to bob_toy → denied
+            },
+        )
+
+        assert _is_access_denied(data), (
+            f"Top-level label_id expanding to a forbidden entity must be denied, "
+            f"got {data}"
+        )
+
     async def test_policy_allows_owned_entity(self, policy_mcp_client) -> None:
         """Alice can successfully toggle her own (owner:alice labelled) entity."""
         client = await policy_mcp_client(_alice_policy_yaml())
