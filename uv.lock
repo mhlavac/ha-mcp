@@ -411,6 +411,7 @@ dependencies = [
     { name = "httpx", extra = ["socks"] },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "ruamel-yaml" },
     { name = "truststore" },
     { name = "websockets" },
 ]
@@ -441,6 +442,7 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
     { name = "pydantic", specifier = "==2.12.5" },
     { name = "python-dotenv", specifier = "==1.2.2" },
+    { name = "ruamel-yaml", specifier = ">=0.18.0" },
     { name = "truststore", specifier = "==0.10.4" },
     { name = "websockets", specifier = "==16.0" },
 ]
