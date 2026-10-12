@@ -1360,6 +1360,7 @@ class TestHomeassistantProxyExemption:
             ("turn_off", "automation.kids_lights"),
             ("toggle", "automation.kids_lights"),
             ("turn_on", "scene.kids_evening"),
+            ("turn_on", "group.kids_lights"),  # HA expands it to its members
             ("turn_on", ["light.kitchen", "script.kids_bedtime"]),
         ],
     )

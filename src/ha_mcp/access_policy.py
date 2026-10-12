@@ -574,11 +574,12 @@ _BUILTIN_CROSS_DOMAIN_SERVICES: frozenset[str] = frozenset(
 
 # Domains whose turn_on/turn_off/toggle run, trigger, enable or activate
 # something with the caller's service data (script variables, automation
-# trigger, scene apply). The built-in homeassistant.turn_on/turn_off/toggle
-# exemption does not reach them: callers use the domain's own service, which
-# the same-domain rule and the entity checks govern.
+# trigger, scene apply), plus ``group``: homeassistant.turn_on/turn_off/toggle
+# expand an old-style group to its MEMBERS, which the policy never sees. The
+# built-in exemption does not reach them: callers use the domain's own
+# service, which the same-domain rule and the entity checks govern.
 _NO_HOMEASSISTANT_PROXY_DOMAINS: frozenset[str] = frozenset(
-    {"script", "automation", "scene"}
+    {"script", "automation", "scene", "group"}
 )
 
 
@@ -701,7 +702,8 @@ class AccessPolicy:
            writable entity and run with arbitrary effect. The built-in
            ``homeassistant.turn_on/turn_off/toggle`` exemption does not
            cover ``script.*``/``automation.*``/``scene.*`` targets (it would
-           run or trigger them with the caller's data); an explicit
+           run or trigger them with the caller's data) nor ``group.*`` ones
+           (HA expands a group to its unchecked members); an explicit
            ``allow_cross_domain`` entry still does.
 
         Domain/service are lowercased first, as HA's service registry does.
@@ -726,9 +728,10 @@ class AccessPolicy:
             )
             if proxied:
                 return (
-                    f"{spec} may not target script/automation/scene entities "
+                    f"{spec} may not target script/automation/scene/group entities "
                     f"({_shown(proxied)}): it would run, trigger or enable them "
-                    "with the caller's data; call that domain's own service "
+                    "with the caller's data, or switch a group's unchecked "
+                    "members; call that domain's own service "
                     "(e.g. script.turn_on) instead"
                 )
             return None

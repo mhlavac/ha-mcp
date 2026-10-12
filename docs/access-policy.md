@@ -281,8 +281,10 @@ Exceptions:
   dispatch to each target's own domain, so they can target any entity.
   Each target is still write-checked. One exception to the exception:
   `homeassistant.turn_on`/`turn_off`/`toggle` may **not** target `script.*`,
-  `automation.*` or `scene.*` entities. On those they run the script with
-  the caller's data, trigger or disable the automation, or apply the scene.
+  `automation.*`, `scene.*` or `group.*` entities. On those they run the
+  script with the caller's data, trigger or disable the automation, apply
+  the scene, or switch every member of the group (members the policy never
+  checks).
   Use that domain's own service instead (`script.turn_on`,
   `automation.trigger`, `scene.turn_on`), which the same-domain rule and the
   entity checks govern. `homeassistant.update_entity` keeps the exemption.

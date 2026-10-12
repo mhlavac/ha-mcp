@@ -662,7 +662,7 @@ class HomeAssistantClient:
 
         # Build endpoint - start_time goes in URL path if provided
         if start_time:
-            endpoint = f"/logbook/{start_time}"
+            endpoint = f"/logbook/{_path_segment(start_time)}"
         else:
             endpoint = "/logbook"
 
