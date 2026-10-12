@@ -28,8 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 def _path_segment(value: str) -> str:
-    """Quote one REST path segment so it can never add or climb a segment."""
-    return quote(str(value), safe="")
+    """Quote one REST path segment so it can never add or climb a segment.
+
+    Quoting leaves ``.`` and ``..`` as they are and httpx normalises them
+    (``/states/..`` becomes ``/api``), so those and the empty segment are
+    refused outright: no Home Assistant id is one of them.
+    """
+    segment = quote(str(value), safe="")
+    if segment in ("", ".", ".."):
+        raise ValueError(f"invalid REST path segment: {value!r}")
+    return segment
 
 
 def _deny(entity_id: str, operation: str, reason: str | None = None) -> NoReturn:

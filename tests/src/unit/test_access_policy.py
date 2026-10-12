@@ -774,6 +774,15 @@ class TestServiceCallEnforcement:
         await client.call_service(" Light ", "TURN_ON", {"entity_id": "light.kitchen"})
         assert client._request.await_args.args[:2] == ("POST", "/services/light/turn_on")
 
+    @pytest.mark.parametrize("segment", ["", ".", ".."])
+    def test_dot_segments_are_refused(self, segment: str):
+        """quote() leaves dots alone and httpx collapses them: /states/.. -> /api."""
+        from ha_mcp.client.rest_client import _path_segment
+
+        with pytest.raises(ValueError):
+            _path_segment(segment)
+        assert _path_segment("light.kitchen") == "light.kitchen"
+
     async def test_state_and_event_paths_are_quoted(self):
         from unittest.mock import AsyncMock
 
