@@ -663,6 +663,7 @@ class TestAreaSearchUnderPolicy:
             for e in _EMILY_ENTITY_REGISTRY
         }
         cache._area_labels = {}
+        cache._area_names = {a["area_id"]: a["name"] for a in _EMILY_AREAS}
         cache._fetched_at = float("inf")  # never refresh
         policy = AccessPolicy(
             PolicyConfig(
@@ -726,3 +727,33 @@ class TestAreaSearchUnderPolicy:
             "light.emily_ceiling", "light.emily_2_lamp",
         }
         assert [a["entity_count"] for a in data["matched_areas"]] == [1, 1]
+
+    async def test_domain_listing_carries_area_from_policy_cache(self):
+        """Under a policy the areas come from its metadata cache: no fetch."""
+        client, ws, _ = self._policy_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ):
+            data = await _search(client, domain_filter="light", limit=50)
+        areas = {r["entity_id"]: (r["area_id"], r["area_name"]) for r in data["results"]}
+        assert areas == {
+            "light.emily_ceiling": ("emily", "Emily L1"),
+            "light.emily_2_lamp": ("emily_2", "Emily"),  # via its device
+            "light.den": ("emilys_den", "Emilys Den"),
+            "light.kitchen": ("kitchen", "Kitchen"),  # own area beats device's
+            "light.hallway": (None, None),
+            "light.desk": (None, None),  # no registry entry
+        }
+        ws.send_command.assert_not_awaited()
+
+    async def test_domain_listing_empty_page_skips_area_lookup(self):
+        client, ws, _ = self._policy_client()
+        client.policy.cache.entity_areas = AsyncMock()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ):
+            data = await _search(client, domain_filter="light", limit=10, offset=50)
+        assert data["results"] == []
+        client.policy.cache.entity_areas.assert_not_awaited()

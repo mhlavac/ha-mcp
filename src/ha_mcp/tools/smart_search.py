@@ -8,6 +8,7 @@ import random
 import time
 from typing import Any
 
+from ..access_policy import registry_entries
 from ..client.rest_client import HomeAssistantClient
 from ..config import get_global_settings
 from ..utils.fuzzy_search import calculate_partial_ratio, create_fuzzy_searcher
@@ -234,46 +235,50 @@ class SmartSearchTools:
 
     async def get_area_index(
         self,
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[str, str]]]:
         """Fetch the area registry and every entity's resolved area.
 
         Returns ``(areas, entity_areas)``: ``areas`` maps area_id -> area
         registry entry (registry order), ``entity_areas`` maps entity_id ->
-        area_id, where an entity's own area wins over its device's area.
-        Entities in neither map have no area. Registry fetch failures yield
-        empty maps (area data is enrichment). Under an access policy the
-        entity and device registry responses are already filtered, so an
+        ``(area_id, area_name)``, where an entity's own area wins over its
+        device's area and the name falls back to the area id. Entities
+        without an area are not in ``entity_areas``. Registry fetch failures
+        yield empty maps (area data is enrichment). Under an access policy
+        the entity and device registry responses are already filtered, so an
         unreadable entity never appears in ``entity_areas``.
         """
-        results: list[Any] = await asyncio.gather(
-            self.client.send_websocket_message({"type": "config/area_registry/list"}),
-            self.client.send_websocket_message(
-                {"type": "config/entity_registry/list"}
-            ),
-            self.client.send_websocket_message(
-                {"type": "config/device_registry/list"}
+        registries = ("area", "entity", "device")
+        results = await asyncio.gather(
+            *(
+                self.client.send_websocket_message(
+                    {"type": f"config/{name}_registry/list"}
+                )
+                for name in registries
             ),
             return_exceptions=True,
         )
-        area_res, entity_res, device_res = results
+        for name, res in zip(registries, results, strict=True):
+            if isinstance(res, BaseException):
+                logger.debug(f"Could not fetch {name} registry: {res}")
+        area_entries, entity_entries, device_entries = (
+            registry_entries(res) or [] for res in results
+        )
 
-        def _entries(res: Any) -> list[dict[str, Any]]:
-            if isinstance(res, dict) and res.get("success"):
-                return [e for e in res.get("result") or [] if isinstance(e, dict)]
-            return []
-
-        areas = {a["area_id"]: a for a in _entries(area_res) if a.get("area_id")}
+        areas = {a["area_id"]: a for a in area_entries if a.get("area_id")}
         device_areas = {
-            d["id"]: d.get("area_id") for d in _entries(device_res) if d.get("id")
+            d["id"]: d.get("area_id") for d in device_entries if d.get("id")
         }
-        entity_areas: dict[str, str] = {}
-        for entry in _entries(entity_res):
+        entity_areas: dict[str, tuple[str, str]] = {}
+        for entry in entity_entries:
             entity_id = entry.get("entity_id")
             area_id = entry.get("area_id") or device_areas.get(
                 entry.get("device_id") or ""
             )
             if entity_id and area_id:
-                entity_areas[entity_id] = area_id
+                entity_areas[entity_id] = (
+                    area_id,
+                    areas.get(area_id, {}).get("name", area_id),
+                )
         return areas, entity_areas
 
     async def get_entities_by_area(
@@ -338,7 +343,7 @@ class SmartSearchTools:
                 # Find all entities in this area
                 area_entities = [
                     entity_id
-                    for entity_id, resolved_area in entity_area_resolved.items()
+                    for entity_id, (resolved_area, _) in entity_area_resolved.items()
                     if resolved_area == area_id
                 ]
 
@@ -437,24 +442,10 @@ class SmartSearchTools:
         try:
             # Fetch all data in parallel for better performance
             # Using asyncio.gather with return_exceptions=True to handle failures gracefully
-            entities_task = self.client.get_states()
-            services_task = self.client.get_services()
-            area_registry_task = self.client.send_websocket_message(
-                {"type": "config/area_registry/list"}
-            )
-            entity_registry_task = self.client.send_websocket_message(
-                {"type": "config/entity_registry/list"}
-            )
-            device_registry_task = self.client.send_websocket_message(
-                {"type": "config/device_registry/list"}
-            )
-
             results = await asyncio.gather(
-                entities_task,
-                services_task,
-                area_registry_task,
-                entity_registry_task,
-                device_registry_task,
+                self.client.get_states(),
+                self.client.get_services(),
+                self.get_area_index(),
                 return_exceptions=True,
             )
 
@@ -473,42 +464,12 @@ class SmartSearchTools:
             else:
                 services = results[1]
 
-            # Handle area registry result
-            area_registry: list[dict[str, Any]] = []
-            if isinstance(results[2], Exception):
-                logger.debug(f"Could not fetch area registry: {results[2]}")
-            elif isinstance(results[2], dict) and results[2].get("success"):
-                area_registry = results[2].get("result", [])
-
-            # Handle entity registry result
-            entity_registry: list[dict[str, Any]] = []
-            if isinstance(results[3], Exception):
-                logger.debug(f"Could not fetch entity registry: {results[3]}")
-            elif isinstance(results[3], dict) and results[3].get("success"):
-                entity_registry = results[3].get("result", [])
-
-            # Handle device registry result
-            device_area_map: dict[str, str | None] = {}
-            if isinstance(results[4], Exception):
-                logger.debug(f"Could not fetch device registry: {results[4]}")
-            elif isinstance(results[4], dict) and results[4].get("success"):
-                for device in results[4].get("result", []):
-                    device_id = device.get("id", "")
-                    if device_id:
-                        device_area_map[device_id] = device.get("area_id")
-
-            # Build entity_id -> area_id mapping from entity + device registries
-            # Priority: entity direct area_id > device area_id
-            entity_area_map: dict[str, str | None] = {}
-            for entry in entity_registry:
-                entity_id = entry.get("entity_id")
-                area_id = entry.get("area_id")
-                if not area_id:
-                    device_id = entry.get("device_id")
-                    if device_id:
-                        area_id = device_area_map.get(device_id)
-                if entity_id:
-                    entity_area_map[entity_id] = area_id
+            # Areas and each entity's area (entity area, else its device's)
+            if isinstance(results[2], BaseException):
+                logger.debug(f"Could not fetch the area index: {results[2]}")
+                area_registry, entity_area_map = {}, {}
+            else:
+                area_registry, entity_area_map = results[2]
 
             # Determine defaults based on detail_level
             # max_entities_per_domain=0 means "uncap everything" (entities + states)
@@ -523,15 +484,10 @@ class SmartSearchTools:
                 include_entity_id = detail_level == "full"
 
             # Pre-populate area_stats to include empty areas
-            area_stats: dict[str, dict[str, Any]] = {}
-            for area in area_registry:
-                area_id = area.get("area_id", "")
-                if area_id:
-                    area_stats[area_id] = {
-                        "name": area.get("name", area_id),
-                        "count": 0,
-                        "domains": {},
-                    }
+            area_stats: dict[str, dict[str, Any]] = {
+                area_id: {"name": area.get("name", area_id), "count": 0, "domains": {}}
+                for area_id, area in area_registry.items()
+            }
 
             # Normalize domains filter
             domains_filter_set: set[str] | None = None
@@ -583,7 +539,7 @@ class SmartSearchTools:
                 domain_stats[domain]["all_entities"].append(entity_data)
 
                 # Area analysis - use entity + device registry mapping
-                area_id = entity_area_map.get(entity_id)
+                area_id = entity_area_map.get(entity_id, (None, None))[0]
                 if area_id and area_id in area_stats:
                     area_stats[area_id]["count"] += 1
                     if domain not in area_stats[area_id]["domains"]:

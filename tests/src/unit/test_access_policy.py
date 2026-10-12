@@ -56,6 +56,7 @@ class FakeCache(EntityMetadataCache):
 
         self._entities = entities or {}
         self._area_labels = area_labels or {}
+        self._area_names: dict[str, str] = {}
         # Entities with a state but no registry entry (the live
         # GET /api/states/<id> lookup answers True for these only).
         self._state_only = state_only or set()

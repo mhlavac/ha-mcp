@@ -49,10 +49,14 @@ def _build_pagination_metadata(
 
 
 def _group_by_domain(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group result dicts by their ``domain`` key, preserving order."""
+    """Group result dicts by domain, preserving order.
+
+    The domain is the ``domain`` key, else the ``entity_id`` prefix.
+    """
     by_domain: dict[str, list[dict[str, Any]]] = {}
     for item in results:
-        by_domain.setdefault(item["domain"], []).append(item)
+        domain = item["domain"] if "domain" in item else item["entity_id"].split(".")[0]
+        by_domain.setdefault(domain, []).append(item)
     return by_domain
 
 
@@ -250,21 +254,19 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                             {
                                 **entity,
                                 "area_id": area_id,
-                                "area_name": area_data.get("area_name", area_id),
+                                "area_name": area_data["area_name"],
                             }
                         )
                         area_counts[area_id] += 1
                 area_meta: dict[str, Any] = {
                     "area_filter": area_filter,
-                    "area_name": ", ".join(
-                        str(a.get("area_name", a.get("area_id"))) for a in matched_areas
-                    )
+                    "area_name": ", ".join(str(a["area_name"]) for a in matched_areas)
                     or None,
                     "matched_areas": [
                         {
-                            "area_id": a.get("area_id"),
-                            "area_name": a.get("area_name", a.get("area_id")),
-                            "entity_count": area_counts[a.get("area_id")],
+                            "area_id": a["area_id"],
+                            "area_name": a["area_name"],
+                            "entity_count": area_counts[a["area_id"]],
                         }
                         for a in matched_areas
                     ],
@@ -366,8 +368,18 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
             # Regular entity search (no area filter)
             # Handle empty query with domain_filter - list all entities of that domain
             if domain_filter and (not query or not query.strip()):
-                # Get all entities directly from the client
-                all_entities = await client.get_states()
+                # Each result carries its area (own area, else its device's)
+                # so rooms can be told apart without parsing names. Under a
+                # policy its metadata cache already holds every entity's area;
+                # otherwise fetch the registries alongside the states.
+                policy = getattr(client, "policy", None)
+                entity_areas: dict[str, tuple[str, str]] = {}
+                if policy is None:
+                    all_entities, (_, entity_areas) = await asyncio.gather(
+                        client.get_states(), smart_tools.get_area_index()
+                    )
+                else:
+                    all_entities = await client.get_states()
 
                 # Filter by domain
                 filtered_entities = [
@@ -378,14 +390,15 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
                 # Format results to match fuzzy search output
                 paginated_entities = filtered_entities[offset : offset + limit]
-                # Area of each entity (own area, else its device's) so rooms
-                # can be told apart without parsing names.
-                areas, entity_areas = await smart_tools.get_area_index()
+                if policy is not None and paginated_entities:
+                    entity_areas = await policy.cache.entity_areas(
+                        e.get("entity_id", "") for e in paginated_entities
+                    )
                 results = []
                 for entity in paginated_entities:
                     entity_id = entity.get("entity_id", "")
                     attributes = entity.get("attributes", {})
-                    area_id = entity_areas.get(entity_id)
+                    area_id, area_name = entity_areas.get(entity_id, (None, None))
                     results.append(
                         {
                             "entity_id": entity_id,
@@ -395,11 +408,7 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                             "score": 100,  # Perfect match since we're listing by domain
                             "match_type": "domain_listing",
                             "area_id": area_id,
-                            "area_name": (
-                                areas.get(area_id, {}).get("name", area_id)
-                                if area_id
-                                else None
-                            ),
+                            "area_name": area_name,
                         }
                     )
 
@@ -513,13 +522,7 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
             # Group by domain if requested
             if group_by_domain_bool and "results" in result:
-                by_domain: dict[str, list[dict[str, Any]]] = {}
-                for entity in result["results"]:
-                    domain = entity.get("domain", entity["entity_id"].split(".")[0])
-                    if domain not in by_domain:
-                        by_domain[domain] = []
-                    by_domain[domain].append(entity)
-                result["by_domain"] = by_domain
+                result["by_domain"] = _group_by_domain(result["results"])
 
             result["search_type"] = search_type
 

@@ -274,17 +274,22 @@ def _reduce_device_registry(
 
 def _reduce_area_registry(
     result: Any, expand_labels: Callable[[Iterable[str]], set[str]]
-) -> dict[str, set[str]] | None:
-    """Extract ``area_id -> expanded_labels``; None when the fetch failed."""
+) -> tuple[dict[str, set[str]], dict[str, str]] | None:
+    """Extract ``(area_id -> expanded_labels, area_id -> name)``.
+
+    None when the fetch failed.
+    """
     entries = registry_entries(result)
     if entries is None:
         return None
-    out: dict[str, set[str]] = {}
+    labels: dict[str, set[str]] = {}
+    names: dict[str, str] = {}
     for area in entries:
         area_id = area.get("area_id")
         if area_id:
-            out[area_id] = expand_labels(area.get("labels") or [])
-    return out
+            labels[area_id] = expand_labels(area.get("labels") or [])
+            names[area_id] = area.get("name", area_id)
+    return labels, names
 
 
 def _reduce_entity_registry(
@@ -321,7 +326,8 @@ class EntityMetadataCache:
     Fetches entity/device/label/area registries in parallel and precomputes
     the entity→device fallback for ``area_id`` and ``labels``. Area labels
     are kept separately (``area_labels()``): they only widen ``label_id``
-    target expansion, never rule matching.
+    target expansion, never rule matching. Area names serve
+    ``entity_areas()``.
 
     Labels union: HA stores label IDs (slugs like ``owner_alice``) on
     entities/devices, but users naturally write rules using label NAMES
@@ -343,6 +349,8 @@ class EntityMetadataCache:
         # until the area registry has been fetched successfully once, so
         # label_id expansion can fail closed instead of skipping areas.
         self._area_labels: dict[str, set[str]] | None = None
+        # area_id -> area name (from the same area registry fetch).
+        self._area_names: dict[str, str] = {}
         self._fetched_at: float = 0.0
         self._lock = asyncio.Lock()
 
@@ -372,20 +380,20 @@ class EntityMetadataCache:
         expand = _label_expander(label_id_to_name)
         device_info = _reduce_device_registry(device_result, expand)
         entities, entity_ok = _reduce_entity_registry(entity_result, device_info, expand)
-        area_labels = _reduce_area_registry(area_result, expand)
+        areas = _reduce_area_registry(area_result, expand)
 
         # Always update _fetched_at so a transient failure doesn't leave the
         # cache permanently "expired" (stampede) nor permanently "fresh"
         # (hiding newly-created entities).
         self._fetched_at = time.monotonic()
 
-        if area_labels is None:
+        if areas is None:
             logger.warning(
-                "area_registry fetch failed, keeping previous area labels: %s",
+                "area_registry fetch failed, keeping previous areas: %s",
                 area_result,
             )
         else:
-            self._area_labels = area_labels
+            self._area_labels, self._area_names = areas
 
         if not entity_ok:
             logger.warning(
@@ -427,6 +435,26 @@ class EntityMetadataCache:
         guarantee — call ``ensure_fresh()`` first.
         """
         return self._area_labels
+
+    async def entity_areas(
+        self, entity_ids: Iterable[str]
+    ) -> dict[str, tuple[str, str]]:
+        """Map each of ``entity_ids`` that has an area to ``(area_id, area_name)``.
+
+        The area is the cached one (the entity's own, else its device's);
+        the name falls back to the area id when the area registry has no
+        name for it. Entities without an area are left out.
+        """
+        await self.ensure_fresh()
+        out: dict[str, tuple[str, str]] = {}
+        for entity_id in entity_ids:
+            meta = self._entities.get(entity_id)
+            if meta is not None and meta.area_id:
+                out[entity_id] = (
+                    meta.area_id,
+                    self._area_names.get(meta.area_id, meta.area_id),
+                )
+        return out
 
     async def is_known_batch(
         self, entity_ids: Iterable[str]
