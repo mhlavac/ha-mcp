@@ -31,6 +31,8 @@ from ha_mcp.access_policy import (
     set_global_policy,
 )
 
+from .conftest import offline_client
+
 
 class FakeCache(EntityMetadataCache):
     """Test double that bypasses websocket fetches.
@@ -703,23 +705,13 @@ def _svc_client(
     never reached Home Assistant. Every ``_SVC_ENTITIES`` entry is a known
     (registry) entity; ``state_only`` adds entities that only have a state.
     """
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from ha_mcp.client.rest_client import HomeAssistantClient
-
     cfg_kwargs.setdefault("entities", EntitiesPolicy(allow=_SVC_ALLOW))
     cfg = PolicyConfig(services=services or ServicesPolicy(), **cfg_kwargs)
-    with patch.object(HomeAssistantClient, "__init__", lambda self, **kw: None):
-        client = HomeAssistantClient()
-    client.base_url = "http://test.local:8123"
-    client.token = "test-token"
-    client.timeout = 30
-    client.httpx_client = MagicMock()
-    client.policy = make_policy(
-        cfg, dict(_SVC_ENTITIES), area_labels=area_labels, state_only=state_only
+    return offline_client(
+        make_policy(
+            cfg, dict(_SVC_ENTITIES), area_labels=area_labels, state_only=state_only
+        )
     )
-    client._request = AsyncMock(return_value=[])  # type: ignore[method-assign]
-    return client
 
 
 async def _assert_denied(
@@ -784,15 +776,40 @@ class TestServiceCallEnforcement:
     async def test_state_and_event_paths_are_quoted(self):
         from unittest.mock import AsyncMock
 
-        client = _svc_client()
-        client.policy = None
-        client._request = AsyncMock(return_value={})  # type: ignore[method-assign]
+        client = offline_client(request=AsyncMock(return_value={}))
         await client.get_entity_state("light.x/../../services/script/front_door_open")
         assert client._request.await_args.args[1] == (
             "/states/light.x%2F..%2F..%2Fservices%2Fscript%2Ffront_door_open"
         )
         await client.fire_event("x/../../services/script/front_door_open")
         assert client._request.await_args.args[1].startswith("/events/x%2F..")
+
+    async def test_caller_supplied_path_segments_are_quoted(self):
+        from unittest.mock import AsyncMock
+
+        client = offline_client(request=AsyncMock(return_value={}))
+        client.send_websocket_message = AsyncMock(  # type: ignore[method-assign]
+            return_value={"success": False}
+        )
+        evil = "x/../../services/script/front_door_open"
+        quoted = "x%2F..%2F..%2Fservices%2Fscript%2Ffront_door_open"
+        calls = [
+            (lambda: client.get_history(entity_id=evil), "/history/period/"),
+            (lambda: client.get_automation_config(evil), "/config/automation/config/"),
+            (lambda: client.submit_config_flow_step(evil, {}),
+             "/config/config_entries/flow/"),
+            (lambda: client.abort_config_flow(evil), "/config/config_entries/flow/"),
+            (lambda: client.submit_options_flow_step(evil, {}),
+             "/config/config_entries/options/flow/"),
+            (lambda: client.abort_options_flow(evil),
+             "/config/config_entries/options/flow/"),
+            (lambda: client.delete_config_entry(evil), "/config/config_entries/entry/"),
+            (lambda: client.get_script_config(evil), "config/script/config/"),
+            (lambda: client.delete_script_config(evil), "config/script/config/"),
+        ]
+        for call, prefix in calls:
+            await call()
+            assert client._request.await_args.args[1] == prefix + quoted
 
     @pytest.mark.parametrize(
         ("domain", "service", "data"),
@@ -1052,6 +1069,47 @@ class TestWebSocketServiceCallEnforcement:
                 "domain": "light",
                 "service": "turn_on",
                 "service_data": {"brightness": 10},
+                "target": {"entity_id": "light.kitchen"},
+            })
+        ws.send_command.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("domain", "service"),
+        [("light", "../script/front_door_open"), ("../script", "front_door_open")],
+    )
+    async def test_ws_call_service_path_like_service_name_refused(
+        self, domain: str, service: str
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        from fastmcp.exceptions import ToolError
+
+        client, ws = self._ws_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ), pytest.raises(ToolError, match="slug"):
+            await client.send_websocket_message({
+                "type": "call_service",
+                "domain": domain,
+                "service": service,
+                "target": {"entity_id": "light.kitchen"},
+            })
+        ws.send_command.assert_not_awaited()
+
+    async def test_ws_call_service_name_normalised_before_the_gate(self):
+        """' Light '/'TURN_ON' is gated as light.turn_on, like HA resolves it."""
+        from unittest.mock import AsyncMock, patch
+
+        client, ws = self._ws_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ):
+            await client.send_websocket_message({
+                "type": "call_service",
+                "domain": " Light ",
+                "service": "TURN_ON",
                 "target": {"entity_id": "light.kitchen"},
             })
         ws.send_command.assert_awaited_once()
@@ -1396,6 +1454,32 @@ class TestUnknownTargets:
             client, "light", "turn_on", {"entity_id": ["light.kitchen", "light.landing"]}
         )
         client.policy.cache._state_exists.assert_not_awaited()
+
+    async def test_only_explicit_targets_are_checked_for_existence(self):
+        """Device/area/label expansion comes from the registry: no lookup."""
+        from unittest.mock import AsyncMock
+
+        client = _svc_client()
+        client.policy.cache.is_known_batch = AsyncMock(
+            return_value={"light.landing": True}
+        )
+        await _assert_allowed(
+            client, "light", "turn_off",
+            {"entity_id": "light.landing", "area_id": "kitchen"},
+        )
+        client.policy.cache.is_known_batch.assert_awaited_once_with(["light.landing"])
+
+    async def test_first_unknown_target_in_order_is_denied(self):
+        """Every miss is looked up; the denial names the first unknown id."""
+        client = _svc_client(
+            default_action="allow", state_only={"light.b_state_only"}
+        )
+        payload = await _assert_denied(
+            client, "light", "turn_on",
+            {"entity_id": ["light.d_ghost", "light.b_state_only", "light.c_ghost"]},
+            reason_contains="unknown target entity",
+        )
+        assert payload["entity_id"] == "light.c_ghost"
 
 
 # ---------------------------------------------------------------------------
@@ -1768,7 +1852,7 @@ class TestCacheTTL:
 
 
 class TestIsKnown:
-    """EntityMetadataCache.is_known: registry hit, else live state lookup."""
+    """EntityMetadataCache.is_known_batch: registry hit, else live state lookup."""
 
     @staticmethod
     def _cache(request_side_effect: Any = None) -> tuple[Any, Any]:
@@ -1781,31 +1865,50 @@ class TestIsKnown:
 
     async def test_registry_entity_known_without_state_lookup(self):
         cache, client = self._cache()
-        assert await cache.is_known("light.a") is True
+        assert await cache.is_known_batch(["light.a"]) == {"light.a": True}
         client._request.assert_not_awaited()
 
     async def test_state_only_entity_known(self):
         cache, client = self._cache()
-        assert await cache.is_known("group.legacy") is True
+        assert await cache.is_known_batch(["group.legacy"]) == {"group.legacy": True}
         client._request.assert_awaited_once_with("GET", "/states/group.legacy")
 
     async def test_404_is_unknown(self):
         from ha_mcp.client.rest_client import HomeAssistantAPIError
 
         cache, _ = self._cache(HomeAssistantAPIError("nope", status_code=404))
-        assert await cache.is_known("spotify.track") is False
+        assert await cache.is_known_batch(["spotify.track"]) == {"spotify.track": False}
 
     async def test_lookup_error_is_undetermined(self):
         from ha_mcp.client.rest_client import HomeAssistantConnectionError
 
         cache, _ = self._cache(HomeAssistantConnectionError("down"))
-        assert await cache.is_known("light.b") is None
+        assert await cache.is_known_batch(["light.b"]) == {"light.b": None}
 
     @pytest.mark.parametrize("value", ["light", "light.a/../x", "LIGHT.A", ""])
     async def test_not_entity_shaped_is_unknown_without_lookup(self, value: str):
         cache, client = self._cache()
-        assert await cache.is_known(value) is False
+        assert await cache.is_known_batch([value]) == {value: False}
         client._request.assert_not_awaited()
+
+    async def test_misses_are_looked_up_concurrently(self):
+        import asyncio
+
+        in_flight: set[str] = set()
+        peak = 0
+
+        async def _request(_method: str, endpoint: str) -> dict[str, Any]:
+            nonlocal peak
+            in_flight.add(endpoint)
+            peak = max(peak, len(in_flight))
+            await asyncio.sleep(0)
+            in_flight.discard(endpoint)
+            return {}
+
+        cache, _ = self._cache(_request)
+        known = await cache.is_known_batch(["light.a", "group.x", "group.y", "bad"])
+        assert known == {"light.a": True, "group.x": True, "group.y": True, "bad": False}
+        assert peak == 2
 
 
 # ---------------------------------------------------------------------------

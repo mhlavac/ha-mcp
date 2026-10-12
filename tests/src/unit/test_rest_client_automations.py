@@ -4,14 +4,13 @@ These tests verify error handling for automation configuration operations,
 especially the 405 Method Not Allowed error for addon proxy limitations.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from ha_mcp.client.rest_client import (
-    HomeAssistantAPIError,
-    HomeAssistantClient,
-)
+from ha_mcp.client.rest_client import HomeAssistantAPIError
+
+from .conftest import offline_client
 
 
 class TestDeleteAutomationConfig:
@@ -20,13 +19,7 @@ class TestDeleteAutomationConfig:
     @pytest.fixture
     def mock_client(self):
         """Create a mock HomeAssistantClient for testing."""
-        with patch.object(HomeAssistantClient, "__init__", lambda self, **kwargs: None):
-            client = HomeAssistantClient()
-            client.base_url = "http://test.local:8123"
-            client.token = "test-token"
-            client.timeout = 30
-            client.httpx_client = MagicMock()
-            return client
+        return offline_client()
 
     @pytest.mark.asyncio
     async def test_delete_automation_success(self, mock_client):

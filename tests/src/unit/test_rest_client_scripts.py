@@ -5,7 +5,7 @@ especially the 405 Method Not Allowed error for YAML-defined scripts,
 and script ID resolution via entity registry (#463).
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +13,8 @@ from ha_mcp.client.rest_client import (
     HomeAssistantAPIError,
     HomeAssistantClient,
 )
+
+from .conftest import offline_client
 
 
 def _make_mock_client() -> HomeAssistantClient:
@@ -22,16 +24,11 @@ def _make_mock_client() -> HomeAssistantClient:
     _resolve_script_id falls back to using the bare id. This keeps
     existing tests backward-compatible.
     """
-    with patch.object(HomeAssistantClient, "__init__", lambda self, **kwargs: None):
-        client = HomeAssistantClient()
-        client.base_url = "http://test.local:8123"
-        client.token = "test-token"
-        client.timeout = 30
-        client.httpx_client = MagicMock()
-        client.send_websocket_message = AsyncMock(
-            side_effect=Exception("WebSocket not available in tests")
-        )
-        return client
+    client = offline_client()
+    client.send_websocket_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=Exception("WebSocket not available in tests")
+    )
+    return client
 
 
 class TestDeleteScriptConfig:

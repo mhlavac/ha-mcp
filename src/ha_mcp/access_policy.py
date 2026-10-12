@@ -114,10 +114,14 @@ class ToolsPolicy(BaseModel):
     disabled_tags: list[str] = Field(default_factory=list)
 
 
-_SERVICE_SPEC_RE = re.compile(r"^[a-z0-9_]+\.([a-z0-9_]+|\*)$")
+# A Home Assistant domain, service name or entity object id (lowercase slug).
+_SLUG = r"[a-z0-9_]+"
+SLUG_RE = re.compile(_SLUG)
+
+_SERVICE_SPEC_RE = re.compile(rf"^{_SLUG}\.({_SLUG}|\*)$")
 
 # The shape of a (canonical, lowercased) Home Assistant entity id.
-ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
+ENTITY_ID_RE = re.compile(rf"{_SLUG}\.{_SLUG}")
 
 
 class ServicesPolicy(BaseModel):
@@ -217,15 +221,24 @@ class EntityMeta:
     device_id: str | None = None
 
 
+def registry_entries(result: Any) -> list[dict[str, Any]] | None:
+    """The entries of a ``config/*_registry/list`` WS response.
+
+    None when the fetch failed (an exception from ``gather(...,
+    return_exceptions=True)`` or an unsuccessful response); non-dict entries
+    are dropped.
+    """
+    if not (isinstance(result, dict) and result.get("success")):
+        return None
+    return [e for e in result.get("result") or [] if isinstance(e, dict)]
+
+
 def _reduce_label_registry(result: Any) -> dict[str, str]:
     """Extract ``label_id -> name`` from a ``label_registry/list`` response."""
     if isinstance(result, Exception):
         logger.warning("label_registry fetch failed: %s", result)
-        return {}
-    if not (isinstance(result, dict) and result.get("success")):
-        return {}
     out: dict[str, str] = {}
-    for lbl in result.get("result", []):
+    for lbl in registry_entries(result) or ():
         lid, lname = lbl.get("label_id"), lbl.get("name")
         if lid and lname:
             out[lid] = lname
@@ -248,11 +261,8 @@ def _reduce_device_registry(
     """Extract ``device_id -> (area_id, expanded_labels)`` from the response."""
     if isinstance(result, Exception):
         logger.warning("device_registry fetch failed: %s", result)
-        return {}
-    if not (isinstance(result, dict) and result.get("success")):
-        return {}
     out: dict[str, tuple[str | None, set[str]]] = {}
-    for device in result.get("result", []):
+    for device in registry_entries(result) or ():
         dev_id = device.get("id")
         if dev_id:
             out[dev_id] = (
@@ -266,12 +276,11 @@ def _reduce_area_registry(
     result: Any, expand_labels: Callable[[Iterable[str]], set[str]]
 ) -> dict[str, set[str]] | None:
     """Extract ``area_id -> expanded_labels``; None when the fetch failed."""
-    if isinstance(result, Exception) or not (
-        isinstance(result, dict) and result.get("success")
-    ):
+    entries = registry_entries(result)
+    if entries is None:
         return None
     out: dict[str, set[str]] = {}
-    for area in result.get("result") or []:
+    for area in entries:
         area_id = area.get("area_id")
         if area_id:
             out[area_id] = expand_labels(area.get("labels") or [])
@@ -290,15 +299,13 @@ def _reduce_entity_registry(
     """
     if isinstance(result, Exception):
         return {}, False
-    if not (isinstance(result, dict) and result.get("success")):
-        return {}, True
     entities: dict[str, EntityMeta] = {}
-    for entry in result.get("result", []):
+    for entry in registry_entries(result) or ():
         entity_id = entry.get("entity_id")
         if not entity_id:
             continue
         device_id = entry.get("device_id")
-        dev_area, dev_labels = device_info.get(device_id, (None, set()))
+        dev_area, dev_labels = device_info.get(device_id or "", (None, set()))
         entities[entity_id] = EntityMeta(
             entity_id=entity_id,
             area_id=entry.get("area_id") or dev_area,
@@ -390,7 +397,7 @@ class EntityMetadataCache:
         self._entities = entities
         logger.debug("AccessPolicy metadata cache refreshed: %d entities", len(entities))
 
-    async def _fetch_registries(self) -> tuple[Any, Any, Any, Any]:
+    async def _fetch_registries(self) -> tuple[Any, ...]:
         """Fetch entity/device/label/area registries in parallel with filter bypass."""
         bypass_token = bypass_policy_filter.set(True)
         try:
@@ -411,8 +418,7 @@ class EntityMetadataCache:
             )
         finally:
             bypass_policy_filter.reset(bypass_token)
-        entity_result, device_result, label_result, area_result = results
-        return entity_result, device_result, label_result, area_result
+        return tuple(results)
 
     def area_labels(self) -> dict[str, set[str]] | None:
         """``area_id -> labels`` carried by each area itself (not its entities).
@@ -422,24 +428,34 @@ class EntityMetadataCache:
         """
         return self._area_labels
 
-    async def is_known(self, entity_id: str) -> bool | None:
-        """Whether Home Assistant knows ``entity_id``.
+    async def is_known_batch(
+        self, entity_ids: Iterable[str]
+    ) -> dict[str, bool | None]:
+        """Map each of ``entity_ids`` to whether Home Assistant knows it.
 
         Known = an entity-registry entry OR a current state (entities without
         a unique_id never reach the registry but still exist and can be
         acted on). Registry hits are answered from the cache; misses are
-        checked live with ``GET /api/states/<id>`` so an entity created
-        moments ago (``scene.create``, a new script) is not reported unknown
-        for a whole TTL. Strings that are not entity-id shaped are never
-        known. Returns None when the live lookup failed for another reason
-        — the caller picks the fail-closed direction.
+        checked live — concurrently — with ``GET /api/states/<id>`` so an
+        entity created moments ago (``scene.create``, a new script) is not
+        reported unknown for a whole TTL. Strings that are not entity-id
+        shaped are never known. An id maps to None when its live lookup
+        failed for another reason — the caller picks the fail-closed
+        direction.
         """
-        if not ENTITY_ID_RE.fullmatch(entity_id):
-            return False
+        # Entity-id shaped ids start as known; registry misses are replaced
+        # by their live lookup below.
+        known: dict[str, bool | None] = {
+            e: bool(ENTITY_ID_RE.fullmatch(e)) for e in entity_ids
+        }
+        if not any(known.values()):
+            return known
         await self.ensure_fresh()
-        if entity_id in self._entities:
-            return True
-        return await self._state_exists(entity_id)
+        misses = [e for e, shaped in known.items() if shaped and e not in self._entities]
+        if misses:
+            found = await asyncio.gather(*(self._state_exists(e) for e in misses))
+            known.update(zip(misses, found, strict=True))
+        return known
 
     async def _state_exists(self, entity_id: str) -> bool | None:
         """Live ``GET /api/states/<id>``: True / False (404) / None (error).
@@ -453,12 +469,9 @@ class EntityMetadataCache:
 
         try:
             await self._client._request("GET", f"/states/{entity_id}")
-        except HomeAssistantAPIError as e:
-            if e.status_code == 404:
-                return False
-            logger.warning("state lookup for %s failed: %s", entity_id, e)
-            return None
         except Exception as e:
+            if isinstance(e, HomeAssistantAPIError) and e.status_code == 404:
+                return False
             logger.warning("state lookup for %s failed: %s", entity_id, e)
             return None
         return True
@@ -538,9 +551,6 @@ _BUILTIN_CROSS_DOMAIN_SERVICES: frozenset[str] = frozenset(
 # the same-domain rule and the entity checks govern.
 _NO_HOMEASSISTANT_PROXY_DOMAINS: frozenset[str] = frozenset(
     {"script", "automation", "scene"}
-)
-_HOMEASSISTANT_PROXY_SERVICES: frozenset[str] = (
-    _BUILTIN_CROSS_DOMAIN_SERVICES - {"homeassistant.update_entity"}
 )
 
 
@@ -678,11 +688,15 @@ class AccessPolicy:
         if self._cross_domain.matches(domain, service):
             return None
         if spec in _BUILTIN_CROSS_DOMAIN_SERVICES:
+            # turn_on/turn_off/toggle proxy to the target's own domain
+            # service; update_entity only refreshes it.
+            if spec == "homeassistant.update_entity":
+                return None
             proxied = sorted(
                 e for e in entity_ids
                 if e.partition(".")[0] in _NO_HOMEASSISTANT_PROXY_DOMAINS
             )
-            if spec in _HOMEASSISTANT_PROXY_SERVICES and proxied:
+            if proxied:
                 return (
                     f"{spec} may not target script/automation/scene entities "
                     f"({_shown(proxied)}): it would run, trigger or enable them "
@@ -699,14 +713,6 @@ class AccessPolicy:
             f"but the target includes {_shown(foreign)}; add '{spec}' or "
             f"'{domain}.*' to services.allow_cross_domain to permit"
         )
-
-    async def is_known_entity(self, entity_id: str) -> bool | None:
-        """True/False whether HA knows ``entity_id`` (registry or state).
-
-        None when that could not be determined (live lookup failed). See
-        ``EntityMetadataCache.is_known``.
-        """
-        return await self.cache.is_known(entity_id)
 
     # -- Entity gating ------------------------------------------------------
 

@@ -5,7 +5,7 @@ Home Assistant HTTP client with authentication and error handling.
 import asyncio
 import json
 import logging
-import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 from urllib.parse import quote
 
@@ -13,6 +13,7 @@ import httpx
 
 from ..access_policy import (
     ENTITY_ID_RE,
+    SLUG_RE,
     UnresolvableTargetError,
     bypass_policy_filter,
     implied_service_entity,
@@ -26,13 +27,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Home Assistant domains and service names are lowercase slugs. Anything else
-# would be interpolated into a REST path, and httpx normalises "..": service
-# "../script/front_door_open" with domain "light" reaches
-# /services/script/front_door_open after the policy approved a light.
-_SLUG_RE = re.compile(r"[a-z0-9_]+")
-
-
 def _path_segment(value: str) -> str:
     """Quote one REST path segment so it can never add or climb a segment."""
     return quote(str(value), safe="")
@@ -43,6 +37,26 @@ def _deny(entity_id: str, operation: str, reason: str | None = None) -> NoReturn
     raise_tool_error(
         create_access_denied_error(entity_id, operation=operation, reason=reason)
     )
+
+
+def _service_name(domain: Any, service: Any) -> tuple[str, str]:
+    """Canonicalise a service call's ``domain``/``service``; deny non-slugs.
+
+    Stripped and lowercased the way HA's service registry resolves them,
+    then required to be lowercase slugs. Both the REST and the WS
+    ``call_service`` paths call this before the policy gate. On REST the
+    values become path segments, and httpx normalises "..": service
+    "../script/front_door_open" with domain "light" would reach
+    /services/script/front_door_open after the policy approved a light.
+    """
+    domain, service = str(domain).strip().lower(), str(service).strip().lower()
+    if not (SLUG_RE.fullmatch(domain) and SLUG_RE.fullmatch(service)):
+        _deny(
+            f"{domain}.{service}",
+            operation="call_service",
+            reason="domain and service must be lowercase slugs ([a-z0-9_]+)",
+        )
+    return domain, service
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -352,13 +366,7 @@ class HomeAssistantClient:
             Service response data - list of affected states normally, or dict with
             service response if return_response=True
         """
-        domain, service = str(domain).strip().lower(), str(service).strip().lower()
-        if not (_SLUG_RE.fullmatch(domain) and _SLUG_RE.fullmatch(service)):
-            _deny(
-                f"{domain}.{service}",
-                operation="call_service",
-                reason="domain and service must be lowercase slugs ([a-z0-9_]+)",
-            )
+        domain, service = _service_name(domain, service)
         logger.debug(f"Calling service {domain}.{service} (return_response={return_response})")
 
         payload = data or {}
@@ -392,6 +400,7 @@ class HomeAssistantClient:
     ) -> None:
         """Verify a service call is permitted and every entity it touches is writable.
 
+        ``domain``/``service`` must already be canonical (``_service_name``).
         Scans EVERY target selector at BOTH the top level of the payload AND
         under ``payload["target"]`` — entity_id, device_id, area_id, label_id,
         floor_id — and expands each indirect target via the metadata cache.
@@ -426,15 +435,13 @@ class HomeAssistantClient:
         if not isinstance(target, dict):
             target = {}
 
-        def _sel(key: str) -> set[str]:
+        def _sel(
+            key: str, normalise: Callable[[Any], list[str]] = _as_str_list
+        ) -> set[str]:
             """Union a target selector across the top level and ``target``."""
-            return set(_as_str_list(payload.get(key))) | set(
-                _as_str_list(target.get(key))
-            )
+            return set(normalise(payload.get(key))) | set(normalise(target.get(key)))
 
-        entity_ids: set[str] = set(_as_entity_ids(payload.get("entity_id"))) | set(
-            _as_entity_ids(target.get("entity_id"))
-        )
+        entity_ids = _sel("entity_id", _as_entity_ids)
 
         # HA accepts entity_id="all" as a wildcard affecting every entity of a
         # domain. That cannot be reconciled with per-entity policy, so deny it
@@ -461,6 +468,7 @@ class HomeAssistantClient:
         device_ids = _sel("device_id")
         area_ids = _sel("area_id")
         label_ids = _sel("label_id")
+        expanded: set[str] = set()
         if device_ids or area_ids or label_ids:
             try:
                 expanded = await self.policy.expand_targets(
@@ -468,8 +476,7 @@ class HomeAssistantClient:
                 )
             except UnresolvableTargetError as e:
                 _deny(f"label_id={sorted(label_ids)}", operation=op, reason=str(e))
-            entity_ids.update(expanded)
-            if not entity_ids:
+            if not (entity_ids or expanded):
                 _deny(
                     (
                         f"device_id={sorted(device_ids)}, "
@@ -483,7 +490,7 @@ class HomeAssistantClient:
         # Targetless service calls cannot be gated per-entity. Deny by default
         # under a policy; users opt in via services.allow_targetless (e.g.
         # "persistent_notification.create" or "notify.*").
-        if not entity_ids:
+        if not (entity_ids or expanded):
             if not self.policy.allows_targetless_service(domain, service):
                 _deny(
                     f"{domain}.{service}",
@@ -495,62 +502,78 @@ class HomeAssistantClient:
                     ),
                 )
         else:
-            await self._enforce_targeted_call(domain, service, entity_ids, op)
+            await self._enforce_targeted_call(
+                domain, service, entity_ids, expanded, op
+            )
 
         # Entities named in the service DATA (group_members, scene entities,
         # script variables...) are acted on too — targeted or targetless.
-        for eid, key in sorted(_service_data_entity_refs(payload).items()):
-            if await self.policy.can_write(eid):
-                continue
-            # Only an entity HA knows can be acted on; an id-shaped string
-            # such as media_content_id "spotify.track" is just data. A failed
-            # lookup (None) counts as known — fail closed.
-            if await self.policy.is_known_entity(eid) is False:
-                continue
-            _deny(
-                eid,
-                operation=op,
-                reason=(
-                    f"service data key '{key}' names entity {eid}, which this "
-                    "policy does not allow writing"
-                ),
-            )
+        refs = _service_data_entity_refs(payload)
+        unwritable = [e for e in sorted(refs) if not await self.policy.can_write(e)]
+        if not unwritable:
+            return
+        # Only an entity HA knows can be acted on; an id-shaped string such as
+        # media_content_id "spotify.track" is just data. A failed lookup
+        # (None) counts as known — fail closed.
+        known = await self.policy.cache.is_known_batch(unwritable)
+        for eid in unwritable:
+            if known[eid] is not False:
+                _deny(
+                    eid,
+                    operation=op,
+                    reason=(
+                        f"service data key '{refs[eid]}' names entity {eid}, "
+                        "which this policy does not allow writing"
+                    ),
+                )
 
     async def _enforce_targeted_call(
-        self, domain: str, service: str, entity_ids: set[str], op: str
+        self,
+        domain: str,
+        service: str,
+        explicit: set[str],
+        expanded: set[str],
+        op: str,
     ) -> None:
-        """Gate a TARGETED call on its fully resolved target ``entity_ids``."""
+        """Gate a TARGETED call on its fully resolved targets.
+
+        ``explicit`` are the caller's ``entity_id`` selectors, ``expanded``
+        the device/area/label expansion (registry-derived, so known to HA).
+        """
         assert self.policy is not None  # narrowed by caller
+        targets = explicit | expanded
 
         # Service-level gate for targeted calls: allow_targeted (if set) and
         # the always-on cross-domain rule, over the fully resolved targets.
-        reason = self.policy.targeted_service_denial(domain, service, entity_ids)
+        reason = self.policy.targeted_service_denial(domain, service, targets)
         if reason is not None:
             _deny(f"{domain}.{service}", operation=op, reason=reason)
 
         # script.<name> runs script.<name> whatever it targets — it must be
         # writable too, not just the (same-domain) targets.
         implied = implied_service_entity(domain, service)
-        to_write = entity_ids | ({implied} if implied is not None else set())
+        to_write = targets | ({implied} if implied is not None else set())
         for eid in sorted(to_write):
             if not await self.policy.can_write(eid):
                 _deny(eid, operation=op)
 
-        # Every target must be an entity HA knows. Otherwise a writable-by-
-        # glob or default_action=allow id such as shell_command.fake passes
-        # as a "same-domain targeted call" that targets nothing but still
-        # runs the service with its data. Checked after the write check so
-        # an unwritable id gets the same denial whether or not it exists.
-        for eid in sorted(entity_ids):
-            known = await self.policy.is_known_entity(eid)
-            if known is not True:
+        # Every explicit target must be an entity HA knows (expanded ones come
+        # from the registry). Otherwise a writable-by-glob or
+        # default_action=allow id such as shell_command.fake passes as a
+        # "same-domain targeted call" that targets nothing but still runs the
+        # service with its data. Checked after the write check so an
+        # unwritable id gets the same denial whether or not it exists.
+        unverified = sorted(explicit - expanded)
+        known = await self.policy.cache.is_known_batch(unverified)
+        for eid in unverified:
+            if known[eid] is not True:
                 _deny(
                     eid,
                     operation=op,
                     reason=(
                         "unknown target entity: Home Assistant has no entity "
                         "registry entry or state for it"
-                        if known is False
+                        if known[eid] is False
                         else "unknown target entity: could not verify that "
                         "Home Assistant knows it"
                     ),
@@ -588,7 +611,7 @@ class HomeAssistantClient:
 
         endpoint = "/history/period"
         if entity_id:
-            endpoint += f"/{entity_id}"
+            endpoint += f"/{_path_segment(entity_id)}"
 
         result = await self._request("GET", endpoint, params=params)
         if isinstance(result, list):
@@ -781,7 +804,7 @@ class HomeAssistantClient:
 
         try:
             response = await self._request(
-                "GET", f"/config/automation/config/{unique_id}"
+                "GET", f"/config/automation/config/{_path_segment(unique_id)}"
             )
             return response
         except Exception as e:
@@ -826,7 +849,9 @@ class HomeAssistantClient:
 
         try:
             response = await self._request(
-                "POST", f"/config/automation/config/{unique_id}", json=config
+                "POST",
+                f"/config/automation/config/{_path_segment(unique_id)}",
+                json=config,
             )
 
             # For new automations, query Home Assistant to get the actual entity_id that was assigned
@@ -899,7 +924,7 @@ class HomeAssistantClient:
 
         try:
             response = await self._request(
-                "DELETE", f"/config/automation/config/{unique_id}"
+                "DELETE", f"/config/automation/config/{_path_segment(unique_id)}"
             )
             return {
                 "identifier": identifier,
@@ -976,7 +1001,9 @@ class HomeAssistantClient:
         """
         logger.debug(f"Submitting flow step for flow_id: {flow_id}")
         return await self._request(
-            "POST", f"/config/config_entries/flow/{flow_id}", json=user_input
+            "POST",
+            f"/config/config_entries/flow/{_path_segment(flow_id)}",
+            json=user_input,
         )
 
     async def abort_config_flow(self, flow_id: str) -> dict[str, Any]:
@@ -993,7 +1020,9 @@ class HomeAssistantClient:
             HomeAssistantAPIError: If flow not found or API error
         """
         logger.debug(f"Aborting config flow: {flow_id}")
-        return await self._request("DELETE", f"/config/config_entries/flow/{flow_id}")
+        return await self._request(
+            "DELETE", f"/config/config_entries/flow/{_path_segment(flow_id)}"
+        )
 
     async def start_options_flow(self, entry_id: str) -> dict[str, Any]:
         """
@@ -1038,7 +1067,7 @@ class HomeAssistantClient:
         logger.debug(f"Submitting options flow step for flow_id: {flow_id}")
         return await self._request(
             "POST",
-            f"/config/config_entries/options/flow/{flow_id}",
+            f"/config/config_entries/options/flow/{_path_segment(flow_id)}",
             json=user_input,
         )
 
@@ -1057,7 +1086,7 @@ class HomeAssistantClient:
         """
         logger.debug(f"Aborting options flow: {flow_id}")
         return await self._request(
-            "DELETE", f"/config/config_entries/options/flow/{flow_id}"
+            "DELETE", f"/config/config_entries/options/flow/{_path_segment(flow_id)}"
         )
 
     async def get_config_entry(self, entry_id: str) -> dict[str, Any]:
@@ -1116,7 +1145,9 @@ class HomeAssistantClient:
                 returns an error status.
         """
         logger.debug(f"Deleting config entry: {entry_id}")
-        return await self._request("DELETE", f"/config/config_entries/entry/{entry_id}")
+        return await self._request(
+            "DELETE", f"/config/config_entries/entry/{_path_segment(entry_id)}"
+        )
 
     async def send_websocket_message(self, message: dict[str, Any]) -> dict[str, Any]:
         """Send message via WebSocket and wait for response.
@@ -1226,11 +1257,10 @@ class HomeAssistantClient:
             ws_target = message.get("target")
             if isinstance(ws_target, dict):
                 payload.update(ws_target)
-            await self._enforce_service_call_policy(
-                str(message.get("domain") or ""),
-                str(message.get("service") or ""),
-                payload,
+            domain, service = _service_name(
+                message.get("domain") or "", message.get("service") or ""
             )
+            await self._enforce_service_call_policy(domain, service, payload)
             return
         if msg_type == "execute_script":
             _deny(
@@ -1466,7 +1496,7 @@ class HomeAssistantClient:
         """Get Home Assistant script configuration by script_id."""
         resolved_id = await self._resolve_script_id(script_id)
         try:
-            endpoint = f"config/script/config/{resolved_id}"
+            endpoint = f"config/script/config/{_path_segment(resolved_id)}"
             response = await self._request("GET", endpoint)
 
             return {"success": True, "script_id": resolved_id, "config": response}
@@ -1487,7 +1517,7 @@ class HomeAssistantClient:
         """Create or update Home Assistant script configuration."""
         resolved_id = await self._resolve_script_id(script_id)
         try:
-            endpoint = f"config/script/config/{resolved_id}"
+            endpoint = f"config/script/config/{_path_segment(resolved_id)}"
 
             # Validate required fields
             if "alias" not in config:
@@ -1516,7 +1546,7 @@ class HomeAssistantClient:
         """Delete Home Assistant script configuration."""
         resolved_id = await self._resolve_script_id(script_id)
         try:
-            endpoint = f"config/script/config/{resolved_id}"
+            endpoint = f"config/script/config/{_path_segment(resolved_id)}"
             response = await self._request("DELETE", endpoint)
 
             return {

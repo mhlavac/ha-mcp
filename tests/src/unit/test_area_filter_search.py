@@ -16,6 +16,8 @@ import pytest
 from ha_mcp.tools.smart_search import SmartSearchTools, match_area_ids
 from ha_mcp.tools.tools_search import register_search_tools
 
+from .conftest import offline_client
+
 
 def _ws_success(result):
     """Wrap a result list in a successful WebSocket response."""
@@ -649,7 +651,6 @@ class TestAreaSearchUnderPolicy:
             EntityRule,
             PolicyConfig,
         )
-        from ha_mcp.client.rest_client import HomeAssistantClient
 
         hidden = {"switch.emily_fan", "sensor.emily_2_temp"}
         cache = EntityMetadataCache(client=None, ttl=60.0)  # type: ignore[arg-type]
@@ -673,14 +674,6 @@ class TestAreaSearchUnderPolicy:
             cache,
         )
 
-        with patch.object(HomeAssistantClient, "__init__", lambda self, **kw: None):
-            client = HomeAssistantClient()
-        client.base_url = "http://test.local:8123"
-        client.token = "test-token"
-        client.timeout = 30
-        client.httpx_client = MagicMock()
-        client.policy = policy
-
         async def _request(method: str, endpoint: str, **kwargs: Any) -> Any:
             if endpoint == "/states":
                 return _EMILY_STATES
@@ -688,7 +681,7 @@ class TestAreaSearchUnderPolicy:
                 return {"time_zone": "UTC"}
             raise AssertionError(f"unexpected request {method} {endpoint}")
 
-        client._request = _request  # type: ignore[method-assign]
+        client = offline_client(policy, request=_request)
         registries = {
             "config/area_registry/list": _EMILY_AREAS,
             "config/entity_registry/list": _EMILY_ENTITY_REGISTRY,
@@ -696,9 +689,9 @@ class TestAreaSearchUnderPolicy:
         }
         ws = MagicMock()
         ws.send_command = AsyncMock(
-            side_effect=lambda command, **_kw: {
-                "success": True, "result": [dict(e) for e in registries[command]],
-            }
+            side_effect=lambda command, **_kw: _ws_success(
+                [dict(e) for e in registries[command]]
+            )
         )
         return client, ws, hidden
 
