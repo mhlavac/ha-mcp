@@ -8,9 +8,13 @@ areas because the old implementation used fuzzy matching on entity friendly
 names instead of consulting the entity/device/area registries.
 """
 
+from typing import Any, ClassVar
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from ha_mcp.tools.smart_search import SmartSearchTools
+from ha_mcp.tools.smart_search import SmartSearchTools, match_area_ids
+from ha_mcp.tools.tools_search import register_search_tools
 
 
 def _ws_success(result):
@@ -429,3 +433,303 @@ class TestRegistryFailureGracefulDegradation:
         # Should return empty, not crash
         assert result["total_areas_found"] == 0
         assert result["total_entities"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Exact-first area matching, multi-area merge, area tags on results
+# ---------------------------------------------------------------------------
+
+# Two areas that both exactly match "emily" (one by id, one by name) plus a
+# fuzzy cousin that must NOT be picked when exact matches exist.
+_EMILY_AREAS = [
+    {"area_id": "emily", "name": "Emily L1", "aliases": []},
+    {"area_id": "emily_2", "name": "Emily", "aliases": ["Em's room"]},
+    {"area_id": "emilys_den", "name": "Emilys Den"},
+    {"area_id": "kitchen", "name": "Kitchen", "aliases": ["Cuisine"]},
+]
+_EMILY_STATES = [
+    {"entity_id": eid, "attributes": {"friendly_name": name}, "state": "on"}
+    for eid, name in [
+        ("light.emily_ceiling", "Emily Ceiling"),
+        ("switch.emily_fan", "Emily Fan"),
+        ("light.emily_2_lamp", "Emily Lamp"),
+        ("sensor.emily_2_temp", "Emily Temperature"),
+        ("light.den", "Den Light"),
+        ("light.kitchen", "Kitchen Light"),
+        ("light.hallway", "Hallway Light"),
+        ("light.desk", "Desk Light"),
+    ]
+]
+_EMILY_ENTITY_REGISTRY = [
+    {"entity_id": "light.emily_ceiling", "area_id": "emily", "device_id": None},
+    {"entity_id": "switch.emily_fan", "area_id": "emily", "device_id": None},
+    # area via device
+    {"entity_id": "light.emily_2_lamp", "area_id": None, "device_id": "dev_e2"},
+    {"entity_id": "sensor.emily_2_temp", "area_id": "emily_2", "device_id": None},
+    {"entity_id": "light.den", "area_id": "emilys_den", "device_id": None},
+    # entity area overrides its device's area
+    {"entity_id": "light.kitchen", "area_id": "kitchen", "device_id": "dev_e2"},
+    {"entity_id": "light.hallway", "area_id": None, "device_id": None},
+    # light.desk: state only, no registry entry → no area
+]
+_EMILY_DEVICES = [{"id": "dev_e2", "area_id": "emily_2"}]
+
+
+def _emily_client() -> MockClientWithRegistries:
+    return MockClientWithRegistries(
+        entities=_EMILY_STATES,
+        areas=_EMILY_AREAS,
+        entity_registry=_EMILY_ENTITY_REGISTRY,
+        device_registry=_EMILY_DEVICES,
+    )
+
+
+def _search_tool(client: Any) -> Any:
+    """Register the search tools against ``client`` and return ha_search_entities."""
+    registered: dict[str, Any] = {}
+
+    def tool(*_args: Any, **_kwargs: Any) -> Any:
+        def wrapper(func: Any) -> Any:
+            registered[func.__name__] = func
+            return func
+
+        return wrapper
+
+    mcp = MagicMock()
+    mcp.tool = tool
+    smart_tools = SmartSearchTools(client=client, fuzzy_threshold=60)
+    register_search_tools(mcp, client, smart_tools=smart_tools)
+    return registered["ha_search_entities"]
+
+
+async def _search(client: Any, **kwargs: Any) -> dict[str, Any]:
+    kwargs.setdefault("query", "")
+    result = await _search_tool(client)(**kwargs)
+    return result["data"]
+
+
+class TestExactFirstAreaMatching:
+    """B1: exact id/name/alias matches win; fuzzy only when none is exact."""
+
+    _REGISTRY: ClassVar[dict[str, dict[str, Any]]] = {a["area_id"]: a for a in _EMILY_AREAS}
+
+    def test_all_exact_matches_and_only_those(self):
+        assert match_area_ids("emily", self._REGISTRY) == (["emily", "emily_2"], "exact")
+
+    def test_exact_match_is_case_insensitive_and_trimmed(self):
+        assert match_area_ids("  EMILY ", self._REGISTRY) == (
+            ["emily", "emily_2"], "exact",
+        )
+
+    def test_exact_alias_match(self):
+        assert match_area_ids("cuisine", self._REGISTRY) == (["kitchen"], "exact")
+        assert match_area_ids("em's room", self._REGISTRY) == (["emily_2"], "exact")
+
+    def test_exact_name_match_beats_fuzzy(self):
+        assert match_area_ids("emily l1", self._REGISTRY) == (["emily"], "exact")
+
+    def test_fuzzy_fallback_when_nothing_exact(self):
+        assert match_area_ids("kitchn", self._REGISTRY) == (["kitchen"], "fuzzy")
+
+    def test_no_match(self):
+        assert match_area_ids("garage", self._REGISTRY) == ([], None)
+
+    async def test_get_entities_by_area_returns_every_exact_area(self):
+        tools = SmartSearchTools(client=_emily_client(), fuzzy_threshold=60)
+        result = await tools.get_entities_by_area("emily")
+        assert list(result["areas"]) == ["emily", "emily_2"]
+        assert result["area_match"] == "exact"
+        assert result["total_entities"] == 4
+
+
+class TestAreaOnlySearch:
+    """B2: area_filter + empty query merges every matched area, paginated."""
+
+    async def test_merges_all_matched_areas_with_area_tags(self):
+        data = await _search(_emily_client(), area_filter="emily", limit=50)
+        assert data["search_type"] == "area_only"
+        assert {(r["entity_id"], r["area_id"], r["area_name"]) for r in data["results"]} == {
+            ("light.emily_ceiling", "emily", "Emily L1"),
+            ("switch.emily_fan", "emily", "Emily L1"),
+            ("light.emily_2_lamp", "emily_2", "Emily"),
+            ("sensor.emily_2_temp", "emily_2", "Emily"),
+        }
+        assert data["total_matches"] == 4
+        assert data["area_name"] == "Emily L1, Emily"
+        assert data["matched_areas"] == [
+            {"area_id": "emily", "area_name": "Emily L1", "entity_count": 2},
+            {"area_id": "emily_2", "area_name": "Emily", "entity_count": 2},
+        ]
+
+    async def test_domain_filter_honoured(self):
+        data = await _search(
+            _emily_client(), area_filter="emily", domain_filter="light", limit=50
+        )
+        assert {r["entity_id"] for r in data["results"]} == {
+            "light.emily_ceiling", "light.emily_2_lamp",
+        }
+        assert data["total_matches"] == 2
+        assert data["domain_filter"] == "light"
+        assert set(data["by_domain"]) == {"light"}
+        assert [a["entity_count"] for a in data["matched_areas"]] == [1, 1]
+
+    async def test_paginated_like_domain_listing(self):
+        client = _emily_client()
+        page1 = await _search(client, area_filter="emily", limit=3)
+        page2 = await _search(client, area_filter="emily", limit=3, offset=3)
+        assert (page1["total_matches"], page1["count"], page1["has_more"]) == (4, 3, True)
+        assert page1["next_offset"] == 3
+        assert (page2["count"], page2["has_more"], page2["next_offset"]) == (1, False, None)
+        ids1 = [r["entity_id"] for r in page1["results"]]
+        ids2 = [r["entity_id"] for r in page2["results"]]
+        assert len(set(ids1 + ids2)) == 4
+        # by_domain groups exactly the returned page
+        for page in (page1, page2):
+            grouped = [e["entity_id"] for ents in page["by_domain"].values() for e in ents]
+            assert sorted(grouped) == sorted(r["entity_id"] for r in page["results"])
+
+    async def test_no_matching_area(self):
+        data = await _search(_emily_client(), area_filter="garage")
+        assert data["success"] is True
+        assert data["total_matches"] == 0
+        assert data["results"] == []
+        assert data["matched_areas"] == []
+        assert "garage" in data["message"]
+        assert {a["area_id"] for a in data["available_areas"]} >= {"emily", "kitchen"}
+
+    async def test_area_with_query_also_tagged_and_domain_filtered(self):
+        data = await _search(
+            _emily_client(), query="emily", area_filter="emily",
+            domain_filter="light", limit=50, exact_match=False,
+        )
+        assert data["search_type"] == "area_filtered_query"
+        assert data["results"], data
+        for r in data["results"]:
+            assert r["domain"] == "light"
+            assert r["area_id"] in {"emily", "emily_2"}
+            assert r["area_name"] in {"Emily L1", "Emily"}
+
+
+class TestDomainListingAreas:
+    """B3: the domain listing tags each result with its area."""
+
+    async def test_domain_listing_carries_area(self):
+        data = await _search(_emily_client(), domain_filter="light", limit=50)
+        assert data["search_type"] == "domain_listing"
+        areas = {r["entity_id"]: (r["area_id"], r["area_name"]) for r in data["results"]}
+        assert areas == {
+            "light.emily_ceiling": ("emily", "Emily L1"),
+            "light.emily_2_lamp": ("emily_2", "Emily"),  # via its device
+            "light.den": ("emilys_den", "Emilys Den"),
+            "light.kitchen": ("kitchen", "Kitchen"),  # own area beats device's
+            "light.hallway": (None, None),
+            "light.desk": (None, None),  # no registry entry
+        }
+
+    async def test_domain_listing_survives_registry_failure(self):
+        client = _emily_client()
+        client.send_websocket_message = AsyncMock(  # type: ignore[method-assign]
+            return_value={"success": False, "error": "boom"}
+        )
+        data = await _search(client, domain_filter="light", limit=50)
+        assert data["count"] == 6
+        assert all(r["area_id"] is None and r["area_name"] is None for r in data["results"])
+
+
+class TestAreaSearchUnderPolicy:
+    """An unreadable entity in a matched area never appears in any result."""
+
+    @staticmethod
+    def _policy_client() -> Any:
+        from ha_mcp.access_policy import (
+            AccessPolicy,
+            EntitiesPolicy,
+            EntityMeta,
+            EntityMetadataCache,
+            EntityRule,
+            PolicyConfig,
+        )
+        from ha_mcp.client.rest_client import HomeAssistantClient
+
+        hidden = {"switch.emily_fan", "sensor.emily_2_temp"}
+        cache = EntityMetadataCache(client=None, ttl=60.0)  # type: ignore[arg-type]
+        cache._entities = {
+            e["entity_id"]: EntityMeta(
+                entity_id=e["entity_id"],
+                area_id=e["area_id"] or ("emily_2" if e["device_id"] else None),
+                device_id=e["device_id"],
+            )
+            for e in _EMILY_ENTITY_REGISTRY
+        }
+        cache._area_labels = {}
+        cache._fetched_at = float("inf")  # never refresh
+        policy = AccessPolicy(
+            PolicyConfig(
+                entities=EntitiesPolicy(
+                    allow=[EntityRule(entity_globs=["light.*", "switch.*", "sensor.*"])],
+                    deny=[EntityRule(entity_globs=sorted(hidden))],
+                )
+            ),
+            cache,
+        )
+
+        with patch.object(HomeAssistantClient, "__init__", lambda self, **kw: None):
+            client = HomeAssistantClient()
+        client.base_url = "http://test.local:8123"
+        client.token = "test-token"
+        client.timeout = 30
+        client.httpx_client = MagicMock()
+        client.policy = policy
+
+        async def _request(method: str, endpoint: str, **kwargs: Any) -> Any:
+            if endpoint == "/states":
+                return _EMILY_STATES
+            if endpoint == "/config":
+                return {"time_zone": "UTC"}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client._request = _request  # type: ignore[method-assign]
+        registries = {
+            "config/area_registry/list": _EMILY_AREAS,
+            "config/entity_registry/list": _EMILY_ENTITY_REGISTRY,
+            "config/device_registry/list": _EMILY_DEVICES,
+        }
+        ws = MagicMock()
+        ws.send_command = AsyncMock(
+            side_effect=lambda command, **_kw: {
+                "success": True, "result": [dict(e) for e in registries[command]],
+            }
+        )
+        return client, ws, hidden
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"area_filter": "emily"},
+            {"area_filter": "emily", "domain_filter": "switch"},
+            {"area_filter": "emily", "query": "fan", "exact_match": False},
+            {"area_filter": "emily", "query": "temperature", "exact_match": False},
+            {"domain_filter": "switch"},
+            {"domain_filter": "sensor"},
+        ],
+    )
+    async def test_unreadable_entity_never_listed(self, kwargs: dict[str, Any]):
+        client, ws, hidden = self._policy_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ):
+            data = await _search(client, limit=50, **kwargs)
+        assert not any(h in str(data) for h in hidden), data
+
+    async def test_readable_entities_of_both_areas_still_listed(self):
+        client, ws, _ = self._policy_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ):
+            data = await _search(client, area_filter="emily", limit=50)
+        assert {r["entity_id"] for r in data["results"]} == {
+            "light.emily_ceiling", "light.emily_2_lamp",
+        }
+        assert [a["entity_count"] for a in data["matched_areas"]] == [1, 1]

@@ -48,6 +48,14 @@ def _build_pagination_metadata(
     }
 
 
+def _group_by_domain(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group result dicts by their ``domain`` key, preserving order."""
+    by_domain: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        by_domain.setdefault(item["domain"], []).append(item)
+    return by_domain
+
+
 async def _exact_match_search(
     client: Any, query: str, domain_filter: str | None, limit: int, offset: int = 0
 ) -> dict[str, Any]:
@@ -192,6 +200,16 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - ha_search_entities(query="", domain_filter="scene") - List all scenes
         - ha_search_entities(query="", domain_filter="zone") - List all zones (as entities)
 
+        **Listing Entities by Area:**
+        Use area_filter (area id, name or alias) with an empty query to list a room's entities:
+        - ha_search_entities(query="", area_filter="kitchen") - every entity in the matching area(s)
+        - ha_search_entities(query="", area_filter="kitchen", domain_filter="light") - only its lights
+        If any area matches area_filter exactly (id, name or alias, case-insensitive), all exact
+        matches are used (e.g. both area "emily" and an area named "Emily"); otherwise fuzzy matches.
+        Results from every matched area are merged and paginated with limit/offset;
+        matched_areas lists each area. Area and domain listings give every result an
+        area_id and area_name (None when the entity has no area).
+
         **BEST PRACTICE:** Before performing searches, call ha_get_overview() first to understand:
         - Smart home size and scale (total entities, domains, areas)
         - Language used in entity naming (French/English/mixed)
@@ -214,26 +232,49 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
             # If area_filter is provided, use area-based search
             if area_filter:
                 area_result = await smart_tools.get_entities_by_area(
-                    area_filter, group_by_domain=True
+                    area_filter, group_by_domain=False
                 )
+                matched_areas = list((area_result.get("areas") or {}).values())
+
+                # Every entity of every matched area, tagged with its area,
+                # honouring domain_filter.
+                all_area_entities: list[dict[str, Any]] = []
+                area_counts: dict[str, int] = {}
+                for area_data in matched_areas:
+                    area_id = area_data.get("area_id")
+                    area_counts[area_id] = 0
+                    for entity in area_data.get("entities") or []:
+                        if domain_filter and entity.get("domain") != domain_filter:
+                            continue
+                        all_area_entities.append(
+                            {
+                                **entity,
+                                "area_id": area_id,
+                                "area_name": area_data.get("area_name", area_id),
+                            }
+                        )
+                        area_counts[area_id] += 1
+                area_meta: dict[str, Any] = {
+                    "area_filter": area_filter,
+                    "area_name": ", ".join(
+                        str(a.get("area_name", a.get("area_id"))) for a in matched_areas
+                    )
+                    or None,
+                    "matched_areas": [
+                        {
+                            "area_id": a.get("area_id"),
+                            "area_name": a.get("area_name", a.get("area_id")),
+                            "entity_count": area_counts[a.get("area_id")],
+                        }
+                        for a in matched_areas
+                    ],
+                    "area_match": area_result.get("area_match"),
+                }
+                if domain_filter:
+                    area_meta["domain_filter"] = domain_filter
 
                 # If we also have a query, filter the area results
                 if query and query.strip():
-                    # Get all entities from all areas in the result
-                    all_area_entities = []
-                    if "areas" in area_result:
-                        for area_data in area_result["areas"].values():
-                            if "entities" in area_data:
-                                if isinstance(
-                                    area_data["entities"], dict
-                                ):  # grouped by domain
-                                    for domain_entities in area_data[
-                                        "entities"
-                                    ].values():
-                                        all_area_entities.extend(domain_entities)
-                                else:  # flat list
-                                    all_area_entities.extend(area_data["entities"])
-
                     # Apply fuzzy search to area entities
                     from ..utils.fuzzy_search import create_fuzzy_searcher
 
@@ -250,6 +291,10 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                         }
                         for entity in all_area_entities
                     ]
+                    entity_area = {
+                        e["entity_id"]: (e["area_id"], e["area_name"])
+                        for e in all_area_entities
+                    }
 
                     matches, total_matches = fuzzy_searcher.search_entities(
                         entities_for_search, query, limit, offset
@@ -264,6 +309,8 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                             "state": match["state"],
                             "score": match["score"],
                             "match_type": match["match_type"],
+                            "area_id": entity_area[match["entity_id"]][0],
+                            "area_name": entity_area[match["entity_id"]][1],
                             "area_filter": area_filter,
                         }
                         for match in matches
@@ -276,56 +323,45 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                     search_data: dict[str, Any] = {
                         "success": True,
                         "query": query,
-                        "area_filter": area_filter,
+                        **area_meta,
                         **pagination,
                         "results": results,
                         "search_type": "area_filtered_query",
                     }
 
                     if group_by_domain_bool:
-                        by_domain: dict[str, list[dict[str, Any]]] = {}
-                        for item in results:
-                            domain = item["domain"]
-                            if domain not in by_domain:
-                                by_domain[domain] = []
-                            by_domain[domain].append(item)
-                        search_data["by_domain"] = by_domain
+                        search_data["by_domain"] = _group_by_domain(results)
 
                     return await add_timezone_metadata(client, search_data)
-                else:
-                    # Just area filter, return area results with enhanced format
-                    if area_result.get("areas"):
-                        first_area = next(iter(area_result["areas"].values()))
-                        by_domain = first_area.get("entities", {})
 
-                        # Flatten for results while keeping by_domain structure
-                        all_results = []
-                        for domain, entities in by_domain.items():
-                            for entity in entities:
-                                entity["domain"] = domain
-                                all_results.append(entity)
-
-                        area_search_data = {
-                            "success": True,
-                            "area_filter": area_filter,
-                            "total_matches": len(all_results),
-                            "results": all_results,
-                            "by_domain": by_domain,
-                            "search_type": "area_only",
-                            "area_name": first_area.get("area_name", area_filter),
-                        }
-                        return await add_timezone_metadata(client, area_search_data)
-                    else:
-                        empty_area_data = {
-                            "success": True,
-                            "area_filter": area_filter,
-                            "total_matches": 0,
-                            "results": [],
-                            "by_domain": {},
-                            "search_type": "area_only",
-                            "message": f"No entities found in area: {area_filter}",
-                        }
-                        return await add_timezone_metadata(client, empty_area_data)
+                # Area only (empty query): every matched area's entities,
+                # paginated like the domain listing.
+                paginated = all_area_entities[offset : offset + limit]
+                area_search_data: dict[str, Any] = {
+                    "success": True,
+                    **area_meta,
+                    **_build_pagination_metadata(
+                        len(all_area_entities), offset, limit, paginated
+                    ),
+                    "results": paginated,
+                    # Always present for area-only searches; groups exactly
+                    # the returned page.
+                    "by_domain": _group_by_domain(paginated),
+                    "search_type": "area_only",
+                }
+                if not matched_areas:
+                    area_search_data["message"] = (
+                        f"No area matches: {area_filter}"
+                    )
+                    if "available_areas" in area_result:
+                        area_search_data["available_areas"] = area_result[
+                            "available_areas"
+                        ]
+                elif not all_area_entities:
+                    area_search_data["message"] = (
+                        f"No entities found in area: {area_meta['area_name']}"
+                    )
+                return await add_timezone_metadata(client, area_search_data)
 
             # Regular entity search (no area filter)
             # Handle empty query with domain_filter - list all entities of that domain
@@ -342,10 +378,14 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
                 # Format results to match fuzzy search output
                 paginated_entities = filtered_entities[offset : offset + limit]
+                # Area of each entity (own area, else its device's) so rooms
+                # can be told apart without parsing names.
+                areas, entity_areas = await smart_tools.get_area_index()
                 results = []
                 for entity in paginated_entities:
                     entity_id = entity.get("entity_id", "")
                     attributes = entity.get("attributes", {})
+                    area_id = entity_areas.get(entity_id)
                     results.append(
                         {
                             "entity_id": entity_id,
@@ -354,6 +394,12 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                             "state": entity.get("state", "unknown"),
                             "score": 100,  # Perfect match since we're listing by domain
                             "match_type": "domain_listing",
+                            "area_id": area_id,
+                            "area_name": (
+                                areas.get(area_id, {}).get("name", area_id)
+                                if area_id
+                                else None
+                            ),
                         }
                     )
 
@@ -467,7 +513,7 @@ def register_search_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
             # Group by domain if requested
             if group_by_domain_bool and "results" in result:
-                by_domain = {}
+                by_domain: dict[str, list[dict[str, Any]]] = {}
                 for entity in result["results"]:
                     domain = entity.get("domain", entity["entity_id"].split(".")[0])
                     if domain not in by_domain:

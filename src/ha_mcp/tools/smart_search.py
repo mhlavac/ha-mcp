@@ -62,6 +62,51 @@ def _simplify_states_summary(
     return top
 
 
+# Minimum fuzzy score for an area to match when no area matches exactly.
+AREA_FUZZY_THRESHOLD = 80
+
+
+def match_area_ids(
+    area_query: str, area_registry: dict[str, dict[str, Any]]
+) -> tuple[list[str], str | None]:
+    """Resolve ``area_query`` to area ids, in registry order.
+
+    If any area matches EXACTLY (case-insensitive, trimmed) by area_id, name
+    or one of its aliases, ALL exact matches are returned and nothing else —
+    ``emily`` yields area ``emily`` (named "Emily L1") and area ``emily_2``
+    (named "Emily"), never a fuzzy cousin. Only when nothing matches exactly
+    are areas whose name or id partially matches with a score of at least
+    ``AREA_FUZZY_THRESHOLD`` returned. Returns ``(area_ids, how)`` where
+    ``how`` is ``"exact"``, ``"fuzzy"`` or None (no match).
+    """
+    query = area_query.strip().lower()
+    if not query:
+        return [], None
+
+    def _norm(value: Any) -> str:
+        return value.strip().lower() if isinstance(value, str) else ""
+
+    exact = [
+        area_id
+        for area_id, info in area_registry.items()
+        if query == _norm(area_id)
+        or query == _norm(info.get("name"))
+        or any(query == _norm(alias) for alias in info.get("aliases") or [])
+    ]
+    if exact:
+        return exact, "exact"
+    fuzzy = [
+        area_id
+        for area_id, info in area_registry.items()
+        if max(
+            calculate_partial_ratio(query, _norm(info.get("name"))),
+            calculate_partial_ratio(query, _norm(area_id)),
+        )
+        >= AREA_FUZZY_THRESHOLD
+    ]
+    return fuzzy, ("fuzzy" if fuzzy else None)
+
+
 class SmartSearchTools:
     """Smart search tools with fuzzy matching and AI optimization."""
 
@@ -187,6 +232,50 @@ class SmartSearchTools:
                 },
             )
 
+    async def get_area_index(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        """Fetch the area registry and every entity's resolved area.
+
+        Returns ``(areas, entity_areas)``: ``areas`` maps area_id -> area
+        registry entry (registry order), ``entity_areas`` maps entity_id ->
+        area_id, where an entity's own area wins over its device's area.
+        Entities in neither map have no area. Registry fetch failures yield
+        empty maps (area data is enrichment). Under an access policy the
+        entity and device registry responses are already filtered, so an
+        unreadable entity never appears in ``entity_areas``.
+        """
+        results: list[Any] = await asyncio.gather(
+            self.client.send_websocket_message({"type": "config/area_registry/list"}),
+            self.client.send_websocket_message(
+                {"type": "config/entity_registry/list"}
+            ),
+            self.client.send_websocket_message(
+                {"type": "config/device_registry/list"}
+            ),
+            return_exceptions=True,
+        )
+        area_res, entity_res, device_res = results
+
+        def _entries(res: Any) -> list[dict[str, Any]]:
+            if isinstance(res, dict) and res.get("success"):
+                return [e for e in res.get("result") or [] if isinstance(e, dict)]
+            return []
+
+        areas = {a["area_id"]: a for a in _entries(area_res) if a.get("area_id")}
+        device_areas = {
+            d["id"]: d.get("area_id") for d in _entries(device_res) if d.get("id")
+        }
+        entity_areas: dict[str, str] = {}
+        for entry in _entries(entity_res):
+            entity_id = entry.get("entity_id")
+            area_id = entry.get("area_id") or device_areas.get(
+                entry.get("device_id") or ""
+            )
+            if entity_id and area_id:
+                entity_areas[entity_id] = area_id
+        return areas, entity_areas
+
     async def get_entities_by_area(
         self, area_query: str, group_by_domain: bool = True
     ) -> dict[str, Any]:
@@ -194,8 +283,9 @@ class SmartSearchTools:
         Get entities grouped by area/room using the HA registries for accurate area resolution.
 
         Uses entity registry, device registry, and area registry to determine
-        which area each entity belongs to. Fuzzy matches the query against
-        area names/IDs to find the target area(s).
+        which area each entity belongs to. ``area_query`` is matched against
+        the areas with ``match_area_ids``: every EXACT match (area_id, name or
+        alias, case-insensitive) when there is one, else the fuzzy matches.
 
         Args:
             area_query: Area/room name to search for
@@ -205,76 +295,18 @@ class SmartSearchTools:
             Dictionary with area-grouped entities
         """
         try:
-            # Fetch all registries and states in parallel
-            entities_task = self.client.get_states()
-            area_registry_task = self.client.send_websocket_message(
-                {"type": "config/area_registry/list"}
-            )
-            entity_registry_task = self.client.send_websocket_message(
-                {"type": "config/entity_registry/list"}
-            )
-            device_registry_task = self.client.send_websocket_message(
-                {"type": "config/device_registry/list"}
-            )
-
-            results = await asyncio.gather(
-                entities_task,
-                area_registry_task,
-                entity_registry_task,
-                device_registry_task,
+            # Fetch states and the registries in parallel
+            states_result, index_result = await asyncio.gather(
+                self.client.get_states(),
+                self.get_area_index(),
                 return_exceptions=True,
             )
+            if isinstance(index_result, BaseException):
+                raise index_result
+            area_registry, entity_area_resolved = index_result
+            entities = states_result if isinstance(states_result, list) else []
 
-            entities = results[0] if not isinstance(results[0], Exception) else []
-
-            # Parse area registry: area_id -> area info
-            area_registry: dict[str, dict[str, Any]] = {}
-            if isinstance(results[1], dict) and results[1].get("success"):
-                for area in results[1].get("result", []):
-                    area_id = area.get("area_id", "")
-                    if area_id:
-                        area_registry[area_id] = area
-
-            # Parse entity registry: entity_id -> {area_id, device_id}
-            entity_reg_map: dict[str, dict[str, str | None]] = {}
-            if isinstance(results[2], dict) and results[2].get("success"):
-                for entry in results[2].get("result", []):
-                    entity_id = entry.get("entity_id")
-                    if entity_id:
-                        entity_reg_map[entity_id] = {
-                            "area_id": entry.get("area_id"),
-                            "device_id": entry.get("device_id"),
-                        }
-
-            # Parse device registry: device_id -> area_id
-            device_area_map: dict[str, str | None] = {}
-            if isinstance(results[3], dict) and results[3].get("success"):
-                for device in results[3].get("result", []):
-                    device_id = device.get("id", "")
-                    if device_id:
-                        device_area_map[device_id] = device.get("area_id")
-
-            # Fuzzy match area_query against known area names and IDs
-            area_query_lower = area_query.lower().strip()
-            matched_area_ids: set[str] = set()
-
-            for area_id, area_info in area_registry.items():
-                area_name = area_info.get("name", "")
-                # Exact match on area_id or name (case-insensitive)
-                if (
-                    area_query_lower == area_id.lower()
-                    or area_query_lower == area_name.lower()
-                ):
-                    matched_area_ids.add(area_id)
-                    continue
-                # Fuzzy match on area name
-                name_score = calculate_partial_ratio(
-                    area_query_lower, area_name.lower()
-                )
-                id_score = calculate_partial_ratio(area_query_lower, area_id.lower())
-                best_score = max(name_score, id_score)
-                if best_score >= 80:
-                    matched_area_ids.add(area_id)
+            matched_area_ids, area_match = match_area_ids(area_query, area_registry)
 
             if not matched_area_ids:
                 return {
@@ -287,17 +319,6 @@ class SmartSearchTools:
                         for aid, ainfo in area_registry.items()
                     ],
                 }
-
-            # Build entity_id -> resolved area_id mapping
-            # Priority: entity direct area_id > device area_id
-            entity_area_resolved: dict[str, str] = {}
-            for entity_id, reg_info in entity_reg_map.items():
-                area_id = reg_info.get("area_id")
-                device_id = reg_info.get("device_id")
-                if not area_id and device_id:
-                    area_id = device_area_map.get(device_id)
-                if area_id:
-                    entity_area_resolved[entity_id] = area_id
 
             # Build state lookup for entity details
             state_map: dict[str, dict[str, Any]] = {}
@@ -365,6 +386,7 @@ class SmartSearchTools:
 
             return {
                 "area_query": area_query,
+                "area_match": area_match,
                 "total_areas_found": len(formatted_areas),
                 "total_entities": total_entities,
                 "areas": formatted_areas,
