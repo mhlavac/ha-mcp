@@ -11,7 +11,12 @@ from urllib.parse import quote
 
 import httpx
 
-from ..access_policy import bypass_policy_filter, implied_service_entity
+from ..access_policy import (
+    ENTITY_ID_RE,
+    UnresolvableTargetError,
+    bypass_policy_filter,
+    implied_service_entity,
+)
 from ..config import get_global_settings
 from ..errors import create_access_denied_error, raise_tool_error
 
@@ -69,6 +74,60 @@ def _as_entity_ids(value: Any) -> list[str]:
         for item in _as_str_list(value)
         for part in item.split(",")
     ]
+
+
+# Service-call target selectors. Their values are resolved and gated as the
+# call's TARGET; everything else in the service data is walked for entity ids
+# (``_service_data_entity_refs``).
+_TARGET_SELECTOR_KEYS = frozenset(
+    {"entity_id", "device_id", "area_id", "label_id", "floor_id"}
+)
+
+
+def _service_data_entity_refs(payload: dict[str, Any]) -> dict[str, str]:
+    """Map every entity-id-shaped string in service DATA to the key holding it.
+
+    Entities can be named outside the target: ``media_player.join``
+    ``group_members``, ``tts.speak`` ``media_player_entity_id``,
+    ``scene.apply``/``scene.create`` ``entities`` (a mapping KEYED by entity
+    id) and ``snapshot_entities``, ``group.set`` ``entities``, script
+    ``variables``... HA acts on those too, so the gate must see them.
+
+    Walks the payload recursively — strings, list/tuple/set items, and dict
+    KEYS as well as values — skipping only the target selector keys at the
+    top level and directly under ``target`` (already resolved as the
+    target). Each string is canonicalised like an ``entity_id`` selector
+    (comma-split, stripped, lowercased) and kept when it fullmatches the
+    entity-id shape. Returns ``{entity_id: key path}`` (first path seen).
+    Whether the id names a real entity is the caller's question.
+    """
+    stack: list[tuple[str, Any]] = []
+    for key, value in payload.items():
+        if key in _TARGET_SELECTOR_KEYS:
+            continue
+        if key == "target" and isinstance(value, dict):
+            stack.extend(
+                (f"target.{k}", v) for k, v in value.items()
+                if k not in _TARGET_SELECTOR_KEYS
+            )
+            continue
+        stack.append((str(key), value))
+        stack.append((str(key), key))  # the top-level key itself
+
+    refs: dict[str, str] = {}
+    while stack:
+        path, node = stack.pop()
+        if isinstance(node, str):
+            for eid in _as_entity_ids(node):
+                if ENTITY_ID_RE.fullmatch(eid):
+                    refs.setdefault(eid, path)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                stack.append((path, k))
+                stack.append((f"{path}.{k}", v))
+        elif isinstance(node, (list, tuple, set, frozenset)):
+            stack.extend((f"{path}[{i}]", v) for i, v in enumerate(node))
+    return refs
 
 
 class HomeAssistantError(Exception):
@@ -336,14 +395,19 @@ class HomeAssistantClient:
         Scans EVERY target selector at BOTH the top level of the payload AND
         under ``payload["target"]`` — entity_id, device_id, area_id, label_id,
         floor_id — and expands each indirect target via the metadata cache.
-        Raises ACCESS_DENIED if any touched entity is not writable, if
-        expansion of a target yields zero entities, or if the SERVICE itself
-        may not be called with this target (``services.allow_targeted`` /
-        the always-on cross-domain rule, see
-        ``AccessPolicy.targeted_service_denial``). Checking only the
-        entities is not enough: ``script.front_door_open`` "targeted" at an
-        allowed light would pass every entity check and still run the
+        Raises ACCESS_DENIED if any touched entity is not writable, if a
+        target entity is unknown to HA, if expansion of a target yields zero
+        entities, or if the SERVICE itself may not be called with this
+        target (``services.allow_targeted`` / the always-on cross-domain
+        rule, see ``AccessPolicy.targeted_service_denial``). Checking only
+        the entities is not enough: ``script.front_door_open`` "targeted" at
+        an allowed light would pass every entity check and still run the
         script, because HA hands free-form service data to the script.
+
+        Entity ids inside the rest of the service data (``group_members``,
+        ``scene.apply`` ``entities``, script ``variables``...) must be
+        writable too when they name an entity HA knows — for targeted and
+        allowed targetless calls alike.
 
         Both levels must be scanned because HA's REST service endpoint treats
         ``target`` and the top-level service data as ONE namespace
@@ -398,9 +462,12 @@ class HomeAssistantClient:
         area_ids = _sel("area_id")
         label_ids = _sel("label_id")
         if device_ids or area_ids or label_ids:
-            expanded = await self.policy.expand_targets(
-                device_ids=device_ids, area_ids=area_ids, label_ids=label_ids
-            )
+            try:
+                expanded = await self.policy.expand_targets(
+                    device_ids=device_ids, area_ids=area_ids, label_ids=label_ids
+                )
+            except UnresolvableTargetError as e:
+                _deny(f"label_id={sorted(label_ids)}", operation=op, reason=str(e))
             entity_ids.update(expanded)
             if not entity_ids:
                 _deny(
@@ -427,7 +494,33 @@ class HomeAssistantClient:
                         "services.allow_targetless to permit"
                     ),
                 )
-            return
+        else:
+            await self._enforce_targeted_call(domain, service, entity_ids, op)
+
+        # Entities named in the service DATA (group_members, scene entities,
+        # script variables...) are acted on too — targeted or targetless.
+        for eid, key in sorted(_service_data_entity_refs(payload).items()):
+            if await self.policy.can_write(eid):
+                continue
+            # Only an entity HA knows can be acted on; an id-shaped string
+            # such as media_content_id "spotify.track" is just data. A failed
+            # lookup (None) counts as known — fail closed.
+            if await self.policy.is_known_entity(eid) is False:
+                continue
+            _deny(
+                eid,
+                operation=op,
+                reason=(
+                    f"service data key '{key}' names entity {eid}, which this "
+                    "policy does not allow writing"
+                ),
+            )
+
+    async def _enforce_targeted_call(
+        self, domain: str, service: str, entity_ids: set[str], op: str
+    ) -> None:
+        """Gate a TARGETED call on its fully resolved target ``entity_ids``."""
+        assert self.policy is not None  # narrowed by caller
 
         # Service-level gate for targeted calls: allow_targeted (if set) and
         # the always-on cross-domain rule, over the fully resolved targets.
@@ -438,12 +531,30 @@ class HomeAssistantClient:
         # script.<name> runs script.<name> whatever it targets — it must be
         # writable too, not just the (same-domain) targets.
         implied = implied_service_entity(domain, service)
-        if implied is not None:
-            entity_ids.add(implied)
-
-        for eid in sorted(entity_ids):
+        to_write = entity_ids | ({implied} if implied is not None else set())
+        for eid in sorted(to_write):
             if not await self.policy.can_write(eid):
                 _deny(eid, operation=op)
+
+        # Every target must be an entity HA knows. Otherwise a writable-by-
+        # glob or default_action=allow id such as shell_command.fake passes
+        # as a "same-domain targeted call" that targets nothing but still
+        # runs the service with its data. Checked after the write check so
+        # an unwritable id gets the same denial whether or not it exists.
+        for eid in sorted(entity_ids):
+            known = await self.policy.is_known_entity(eid)
+            if known is not True:
+                _deny(
+                    eid,
+                    operation=op,
+                    reason=(
+                        "unknown target entity: Home Assistant has no entity "
+                        "registry entry or state for it"
+                        if known is False
+                        else "unknown target entity: could not verify that "
+                        "Home Assistant knows it"
+                    ),
+                )
 
     async def get_services(self) -> dict[str, Any]:
         """Get all available services."""

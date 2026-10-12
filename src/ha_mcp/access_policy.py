@@ -116,6 +116,9 @@ class ToolsPolicy(BaseModel):
 
 _SERVICE_SPEC_RE = re.compile(r"^[a-z0-9_]+\.([a-z0-9_]+|\*)$")
 
+# The shape of a (canonical, lowercased) Home Assistant entity id.
+ENTITY_ID_RE = re.compile(r"[a-z0-9_]+\.[a-z0-9_]+")
+
 
 class ServicesPolicy(BaseModel):
     """Service-call policy.
@@ -259,6 +262,22 @@ def _reduce_device_registry(
     return out
 
 
+def _reduce_area_registry(
+    result: Any, expand_labels: Callable[[Iterable[str]], set[str]]
+) -> dict[str, set[str]] | None:
+    """Extract ``area_id -> expanded_labels``; None when the fetch failed."""
+    if isinstance(result, Exception) or not (
+        isinstance(result, dict) and result.get("success")
+    ):
+        return None
+    out: dict[str, set[str]] = {}
+    for area in result.get("result") or []:
+        area_id = area.get("area_id")
+        if area_id:
+            out[area_id] = expand_labels(area.get("labels") or [])
+    return out
+
+
 def _reduce_entity_registry(
     result: Any,
     device_info: dict[str, tuple[str | None, set[str]]],
@@ -292,8 +311,10 @@ def _reduce_entity_registry(
 class EntityMetadataCache:
     """TTL-refreshed cache of entity metadata for policy evaluation.
 
-    Fetches entity/device/label registries in parallel and precomputes the
-    entity→device fallback for ``area_id`` and ``labels``.
+    Fetches entity/device/label/area registries in parallel and precomputes
+    the entity→device fallback for ``area_id`` and ``labels``. Area labels
+    are kept separately (``area_labels()``): they only widen ``label_id``
+    target expansion, never rule matching.
 
     Labels union: HA stores label IDs (slugs like ``owner_alice``) on
     entities/devices, but users naturally write rules using label NAMES
@@ -311,6 +332,10 @@ class EntityMetadataCache:
         self._client = client
         self._ttl = ttl
         self._entities: dict[str, EntityMeta] = {}
+        # area_id -> labels (ids | names) carried by the AREA itself. None
+        # until the area registry has been fetched successfully once, so
+        # label_id expansion can fail closed instead of skipping areas.
+        self._area_labels: dict[str, set[str]] | None = None
         self._fetched_at: float = 0.0
         self._lock = asyncio.Lock()
 
@@ -332,17 +357,28 @@ class EntityMetadataCache:
         into ``can_read_batch`` while the refresh lock is still held
         (deadlock).
         """
-        entity_result, device_result, label_result = await self._fetch_registries()
+        (
+            entity_result, device_result, label_result, area_result
+        ) = await self._fetch_registries()
 
         label_id_to_name = _reduce_label_registry(label_result)
         expand = _label_expander(label_id_to_name)
         device_info = _reduce_device_registry(device_result, expand)
         entities, entity_ok = _reduce_entity_registry(entity_result, device_info, expand)
+        area_labels = _reduce_area_registry(area_result, expand)
 
         # Always update _fetched_at so a transient failure doesn't leave the
         # cache permanently "expired" (stampede) nor permanently "fresh"
         # (hiding newly-created entities).
         self._fetched_at = time.monotonic()
+
+        if area_labels is None:
+            logger.warning(
+                "area_registry fetch failed, keeping previous area labels: %s",
+                area_result,
+            )
+        else:
+            self._area_labels = area_labels
 
         if not entity_ok:
             logger.warning(
@@ -354,8 +390,8 @@ class EntityMetadataCache:
         self._entities = entities
         logger.debug("AccessPolicy metadata cache refreshed: %d entities", len(entities))
 
-    async def _fetch_registries(self) -> tuple[Any, Any, Any]:
-        """Fetch entity/device/label registries in parallel with filter bypass."""
+    async def _fetch_registries(self) -> tuple[Any, Any, Any, Any]:
+        """Fetch entity/device/label/area registries in parallel with filter bypass."""
         bypass_token = bypass_policy_filter.set(True)
         try:
             results = await asyncio.gather(
@@ -368,12 +404,64 @@ class EntityMetadataCache:
                 self._client.send_websocket_message(
                     {"type": "config/label_registry/list"}
                 ),
+                self._client.send_websocket_message(
+                    {"type": "config/area_registry/list"}
+                ),
                 return_exceptions=True,
             )
         finally:
             bypass_policy_filter.reset(bypass_token)
-        entity_result, device_result, label_result = results
-        return entity_result, device_result, label_result
+        entity_result, device_result, label_result, area_result = results
+        return entity_result, device_result, label_result, area_result
+
+    def area_labels(self) -> dict[str, set[str]] | None:
+        """``area_id -> labels`` carried by each area itself (not its entities).
+
+        None until the area registry has been fetched once. No freshness
+        guarantee — call ``ensure_fresh()`` first.
+        """
+        return self._area_labels
+
+    async def is_known(self, entity_id: str) -> bool | None:
+        """Whether Home Assistant knows ``entity_id``.
+
+        Known = an entity-registry entry OR a current state (entities without
+        a unique_id never reach the registry but still exist and can be
+        acted on). Registry hits are answered from the cache; misses are
+        checked live with ``GET /api/states/<id>`` so an entity created
+        moments ago (``scene.create``, a new script) is not reported unknown
+        for a whole TTL. Strings that are not entity-id shaped are never
+        known. Returns None when the live lookup failed for another reason
+        — the caller picks the fail-closed direction.
+        """
+        if not ENTITY_ID_RE.fullmatch(entity_id):
+            return False
+        await self.ensure_fresh()
+        if entity_id in self._entities:
+            return True
+        return await self._state_exists(entity_id)
+
+    async def _state_exists(self, entity_id: str) -> bool | None:
+        """Live ``GET /api/states/<id>``: True / False (404) / None (error).
+
+        Uses the raw ``_request`` on purpose: ``get_entity_state`` is
+        policy-gated, and existence must be answerable for unreadable
+        entities too. ``entity_id`` is entity-id shaped (checked by the
+        caller), so it is a single safe path segment.
+        """
+        from .client.rest_client import HomeAssistantAPIError
+
+        try:
+            await self._client._request("GET", f"/states/{entity_id}")
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                return False
+            logger.warning("state lookup for %s failed: %s", entity_id, e)
+            return None
+        except Exception as e:
+            logger.warning("state lookup for %s failed: %s", entity_id, e)
+            return None
+        return True
 
     def iter_entities(self) -> Iterable[EntityMeta]:
         """Iterate the current snapshot of cached entity metadata.
@@ -443,12 +531,33 @@ _BUILTIN_CROSS_DOMAIN_SERVICES: frozenset[str] = frozenset(
     }
 )
 
+# Domains whose turn_on/turn_off/toggle run, trigger, enable or activate
+# something with the caller's service data (script variables, automation
+# trigger, scene apply). The built-in homeassistant.turn_on/turn_off/toggle
+# exemption does not reach them: callers use the domain's own service, which
+# the same-domain rule and the entity checks govern.
+_NO_HOMEASSISTANT_PROXY_DOMAINS: frozenset[str] = frozenset(
+    {"script", "automation", "scene"}
+)
+_HOMEASSISTANT_PROXY_SERVICES: frozenset[str] = (
+    _BUILTIN_CROSS_DOMAIN_SERVICES - {"homeassistant.update_entity"}
+)
+
+
+class UnresolvableTargetError(Exception):
+    """A service-call target cannot be expanded reliably (callers deny it)."""
+
 
 # The script domain's own services; every OTHER ``script.<object_id>``
 # service runs the script entity ``script.<object_id>`` itself.
 _SCRIPT_DOMAIN_SERVICES: frozenset[str] = frozenset(
     {"turn_on", "turn_off", "toggle", "reload"}
 )
+
+
+def _shown(entity_ids: list[str], limit: int = 5) -> str:
+    """Comma-join the first ``limit`` ids for a denial message."""
+    return ", ".join(entity_ids[:limit]) + (", ..." if len(entity_ids) > limit else "")
 
 
 def implied_service_entity(domain: str, service: str) -> str | None:
@@ -551,7 +660,11 @@ class AccessPolicy:
            ``services.allow_cross_domain``. Without this, a service whose
            data is free-form (``script.<name>``, ``shell_command.*``,
            ``rest_command.*``, ``hassio.*``...) could be "targeted" at any
-           writable entity and run with arbitrary effect.
+           writable entity and run with arbitrary effect. The built-in
+           ``homeassistant.turn_on/turn_off/toggle`` exemption does not
+           cover ``script.*``/``automation.*``/``scene.*`` targets (it would
+           run or trigger them with the caller's data); an explicit
+           ``allow_cross_domain`` entry still does.
 
         Domain/service are lowercased first, as HA's service registry does.
         """
@@ -562,20 +675,38 @@ class AccessPolicy:
                 f"{spec} is not listed in services.allow_targeted; add "
                 f"'{spec}' or '{domain}.*' to permit targeted calls to it"
             )
-        if spec in _BUILTIN_CROSS_DOMAIN_SERVICES or self._cross_domain.matches(
-            domain, service
-        ):
+        if self._cross_domain.matches(domain, service):
+            return None
+        if spec in _BUILTIN_CROSS_DOMAIN_SERVICES:
+            proxied = sorted(
+                e for e in entity_ids
+                if e.partition(".")[0] in _NO_HOMEASSISTANT_PROXY_DOMAINS
+            )
+            if spec in _HOMEASSISTANT_PROXY_SERVICES and proxied:
+                return (
+                    f"{spec} may not target script/automation/scene entities "
+                    f"({_shown(proxied)}): it would run, trigger or enable them "
+                    "with the caller's data; call that domain's own service "
+                    "(e.g. script.turn_on) instead"
+                )
             return None
         # An id without a "." has no domain and can never match (fail-closed).
         foreign = sorted(e for e in entity_ids if not e.startswith(f"{domain}."))
         if not foreign:
             return None
-        shown = ", ".join(foreign[:5]) + (", ..." if len(foreign) > 5 else "")
         return (
             f"cross-domain call: {spec} may only target '{domain}.*' entities, "
-            f"but the target includes {shown}; add '{spec}' or '{domain}.*' to "
-            "services.allow_cross_domain to permit"
+            f"but the target includes {_shown(foreign)}; add '{spec}' or "
+            f"'{domain}.*' to services.allow_cross_domain to permit"
         )
+
+    async def is_known_entity(self, entity_id: str) -> bool | None:
+        """True/False whether HA knows ``entity_id`` (registry or state).
+
+        None when that could not be determined (live lookup failed). See
+        ``EntityMetadataCache.is_known``.
+        """
+        return await self.cache.is_known(entity_id)
 
     # -- Entity gating ------------------------------------------------------
 
@@ -624,6 +755,13 @@ class AccessPolicy:
 
         Returns the union of entities matching any provided target. Empty collection
         arguments are ignored. A fresh cache snapshot is ensured before the scan.
+
+        A label expands like HA expands it: entities carrying the label
+        (directly or via their device) AND every entity of every AREA that
+        carries the label (entity area, else device area — same as an
+        ``area_id`` target). Raises ``UnresolvableTargetError`` for a label
+        target while the area registry has never been fetched, rather than
+        silently checking fewer entities than HA would act on.
         """
         devs = set(device_ids or ())
         areas = set(area_ids or ())
@@ -631,6 +769,13 @@ class AccessPolicy:
         if not (devs or areas or labels):
             return set()
         await self.cache.ensure_fresh()
+        if labels:
+            area_labels = self.cache.area_labels()
+            if area_labels is None:
+                raise UnresolvableTargetError(
+                    "label_id cannot be expanded: the area registry is unavailable"
+                )
+            areas |= {aid for aid, albls in area_labels.items() if albls & labels}
         result: set[str] = set()
         for meta in self.cache.iter_entities():
             if (

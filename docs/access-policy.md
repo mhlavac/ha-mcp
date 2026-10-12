@@ -249,13 +249,18 @@ the allow-list is only consulted when writes are permitted at all.
 
 `allow_targetless` only covers calls **without** a target. It never lets the
 same service be called *with* a target — that is governed by the rules below.
+An allowed targetless call's data is still checked for entity ids — see
+[Entity ids in service data](#entity-ids-in-service-data).
 
 ## Targeted services
 
 A targeted call names at least one target — `entity_id`, `device_id`,
 `area_id` or `label_id`, at the top level or under `target`. Device, area and
-label targets are expanded to their entities. Every resolved entity must be
-writable, **and** the service itself must pass two service-level checks.
+label targets are expanded to their entities the way Home Assistant expands
+them. A `label_id` covers the entities carrying the label (directly or via
+their device) **and every entity in every area carrying the label**. Every
+resolved entity must exist in Home Assistant and be writable, **and** the
+service itself must pass two service-level checks.
 Checking only the entities is not enough. HA passes free-form service data
 straight through to some services. Without the service check,
 `script.front_door_open` "targeted" at an allowed light would pass every
@@ -274,7 +279,15 @@ Exceptions:
 - **Built-in:** `homeassistant.turn_on`, `homeassistant.turn_off`,
   `homeassistant.toggle` and `homeassistant.update_entity`. These services
   dispatch to each target's own domain, so they can target any entity.
-  Each target is still write-checked.
+  Each target is still write-checked. One exception to the exception:
+  `homeassistant.turn_on`/`turn_off`/`toggle` may **not** target `script.*`,
+  `automation.*` or `scene.*` entities. On those they run the script with
+  the caller's data, trigger or disable the automation, or apply the scene.
+  Use that domain's own service instead (`script.turn_on`,
+  `automation.trigger`, `scene.turn_on`), which the same-domain rule and the
+  entity checks govern. `homeassistant.update_entity` keeps the exemption.
+  An explicit `allow_cross_domain` entry such as `homeassistant.turn_on`
+  re-permits it; `allow_targeted` does not.
 - **`services.allow_cross_domain`:** add `domain.service` or `domain.*`
   for integration services that act on other domains' entities:
 
@@ -289,12 +302,60 @@ Device, area and label targets are checked after expansion. For example,
 `light.turn_off` with `area_id: kitchen` is denied if the kitchen also
 contains a `switch` or `sensor`. Even before this rule, an area target only
 passed if every entity in the area was writable. To act on a mixed area,
-list the `entity_id`s explicitly.
+list the `entity_id`s explicitly. The same goes for a `label_id` that is on
+an area: every entity in that area must pass. If the area registry could not
+be fetched, a `label_id` target is denied rather than checked against fewer
+entities than Home Assistant would act on.
 
 `script.<name>` services always run `script.<name>`, whatever they target.
 So for a targeted `script.<name>` call, the `script.<name>` entity must be
 writable too. The domain's own services (`script.turn_on`, `script.turn_off`,
 `script.toggle` and `script.reload`) only check their targets.
+
+### Unknown targets
+
+Every resolved target entity must be an entity Home Assistant knows: an
+entity-registry entry **or** a current state (entities without a unique_id
+have no registry entry but still count). Registry hits come from the
+policy's metadata cache. Anything else is looked up live
+(`GET /api/states/<id>`), so an entity created a moment ago, for example by
+`scene.create`, is found. A target that is neither is denied with
+`unknown target entity`. If the lookup itself fails, the target is denied
+too. Without this check, `shell_command.anything` with
+`entity_id: shell_command.fake` would pass under `default_action: allow` (or
+a `shell_command.*` glob) as a same-domain targeted call that targets
+nothing but still runs the command.
+
+The write check runs first. A target that is not writable gets the usual
+denial whether it exists or not.
+
+### Entity ids in service data
+
+Some services act on entities named **outside** the target:
+`media_player.join` `group_members`, `tts.speak` `media_player_entity_id`,
+`camera.play_stream` `media_player`, `music_assistant.transfer_queue`
+`source_player`, `scene.apply`/`scene.create` `entities` (a mapping keyed by
+entity id) and `snapshot_entities`, `group.set` `entities`/`add_entities`/
+`remove_entities`, script `variables`, and so on. The policy therefore walks
+the whole service data, targeted and targetless calls alike:
+
+- Every string is checked: values, list items and dict **keys**, at any
+  depth. The target selectors (`entity_id`, `device_id`, `area_id`,
+  `label_id`, `floor_id`, at the top level and directly under `target`)
+  are skipped, because they are already resolved as the target.
+- Each string is read like an `entity_id` value: split on commas, stripped,
+  lowercased. A part shaped like an entity id (`domain.object_id`: lowercase
+  letters, digits and `_` on both sides of a single dot) is a candidate.
+- A candidate must be writable if it names an entity Home Assistant knows
+  (registry or state, as above). Otherwise the call is denied with
+  `ACCESS_DENIED`, naming the data key (e.g. `group_members[0]`).
+- A candidate that names no entity is ignored. For example,
+  `media_content_id: "spotify.track"` is just data. If the existence lookup
+  fails, the candidate is treated as an entity (fail closed).
+
+A string that is exactly an entity id is treated as that entity even where
+the service means it as text (for example a `tts.speak` message of
+`"lock.front_door"`). Reword such text if a call is denied.
 
 ### `allow_targeted`: an allow-list for targeted calls (optional)
 
@@ -397,7 +458,9 @@ isolation:
    the service is checked as well as the entities: the cross-domain rule and
    the optional `services.allow_targeted` (see
    [Targetless services](#targetless-services) and
-   [Targeted services](#targeted-services)). This covers the bulk of
+   [Targeted services](#targeted-services)). Target entities must exist in
+   Home Assistant, and entity ids named in the service data must be
+   writable too. This covers the bulk of
    MCP tools — search, state reads, service calls, automations, scripts,
    helpers, todo lists, voice-assistant exposure, etc.
 

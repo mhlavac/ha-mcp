@@ -43,10 +43,20 @@ class FakeCache(EntityMetadataCache):
       constructor — tests will surface the breakage.
     """
 
-    def __init__(self, entities: dict[str, EntityMeta] | None = None):
+    def __init__(
+        self,
+        entities: dict[str, EntityMeta] | None = None,
+        *,
+        area_labels: dict[str, set[str]] | None = None,
+        state_only: set[str] | None = None,
+    ):
         import asyncio
 
         self._entities = entities or {}
+        self._area_labels = area_labels or {}
+        # Entities with a state but no registry entry (the live
+        # GET /api/states/<id> lookup answers True for these only).
+        self._state_only = state_only or set()
         self._fetched_at = float("inf")
         self._lock = asyncio.Lock()
 
@@ -55,6 +65,9 @@ class FakeCache(EntityMetadataCache):
 
     async def _refresh(self) -> None:  # pragma: no cover — never called
         return
+
+    async def _state_exists(self, entity_id: str) -> bool | None:
+        return entity_id in self._state_only
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +90,11 @@ def meta(
 
 
 def make_policy(
-    cfg: PolicyConfig, entities: dict[str, EntityMeta] | None = None
+    cfg: PolicyConfig,
+    entities: dict[str, EntityMeta] | None = None,
+    **cache_kwargs: Any,
 ) -> AccessPolicy:
-    return AccessPolicy(cfg, FakeCache(entities))
+    return AccessPolicy(cfg, FakeCache(entities, **cache_kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +663,14 @@ _SVC_ENTITIES = {
     "lock.front_door": meta("lock.front_door", area_id="hall"),
     "script.kids_bedtime": meta("script.kids_bedtime"),
     "script.front_door_open": meta("script.front_door_open"),
+    # Added for the service-data / unknown-target / label-area cases:
+    "media_player.kitchen": meta("media_player.kitchen", area_id="kitchen_nook"),
+    "media_player.bedroom": meta("media_player.bedroom", area_id="bedroom"),
+    "camera.front": meta("camera.front"),
+    "tts.piper": meta("tts.piper"),
+    "automation.kids_lights": meta("automation.kids_lights"),
+    "scene.kids_evening": meta("scene.kids_evening"),
+    "light.landing": meta("light.landing", area_id="landing"),
 }
 
 _SVC_ALLOW = [
@@ -655,18 +678,30 @@ _SVC_ALLOW = [
         entity_globs=[
             "light.*",
             "media_player.living",
+            "media_player.kitchen",
             "switch.porch",
             "script.kids_bedtime",
+            "camera.front",
+            "tts.piper",
+            "automation.kids_lights",
+            "scene.kids_evening",
         ]
     )
 ]
 
 
-def _svc_client(services: ServicesPolicy | None = None, **cfg_kwargs: Any):
+def _svc_client(
+    services: ServicesPolicy | None = None,
+    *,
+    area_labels: dict[str, set[str]] | None = None,
+    state_only: set[str] | None = None,
+    **cfg_kwargs: Any,
+):
     """HomeAssistantClient with a policy and a mocked transport.
 
     ``_request`` is an AsyncMock, so a test can assert that a denied call
-    never reached Home Assistant.
+    never reached Home Assistant. Every ``_SVC_ENTITIES`` entry is a known
+    (registry) entity; ``state_only`` adds entities that only have a state.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -680,7 +715,9 @@ def _svc_client(services: ServicesPolicy | None = None, **cfg_kwargs: Any):
     client.token = "test-token"
     client.timeout = 30
     client.httpx_client = MagicMock()
-    client.policy = make_policy(cfg, dict(_SVC_ENTITIES))
+    client.policy = make_policy(
+        cfg, dict(_SVC_ENTITIES), area_labels=area_labels, state_only=state_only
+    )
     client._request = AsyncMock(return_value=[])  # type: ignore[method-assign]
     return client
 
@@ -1037,6 +1074,330 @@ class TestWebSocketServiceCallEnforcement:
         ws.send_command.assert_not_awaited()
 
 
+class TestServiceDataEntities:
+    """Entity ids named in service DATA (not the target) are write-checked."""
+
+    _BEDROOM = "media_player.bedroom"  # known, not writable
+
+    @pytest.mark.parametrize(
+        ("domain", "service", "data", "services", "key"),
+        [
+            ("media_player", "join",
+             {"entity_id": "media_player.living", "group_members": [_BEDROOM]},
+             None, "group_members[0]"),
+            ("tts", "speak",
+             {"entity_id": "tts.piper", "media_player_entity_id": _BEDROOM,
+              "message": "hi"},
+             None, "media_player_entity_id"),
+            ("camera", "play_stream",
+             {"entity_id": "camera.front", "media_player": _BEDROOM},
+             None, "media_player"),
+            ("music_assistant", "transfer_queue",
+             {"entity_id": "media_player.living", "source_player": _BEDROOM},
+             ServicesPolicy(allow_cross_domain=["music_assistant.*"]),
+             "source_player"),
+            # entities is a mapping KEYED by entity id
+            ("scene", "apply", {"entities": {_BEDROOM: "playing"}},
+             ServicesPolicy(allow_targetless=["scene.apply"]), "entities"),
+            ("scene", "create",
+             {"scene_id": "x", "entities": {"lock.front_door": {"state": "unlocked"}}},
+             ServicesPolicy(allow_targetless=["scene.create"]), "entities"),
+            ("scene", "create",
+             {"scene_id": "x", "snapshot_entities": ["lock.front_door"]},
+             ServicesPolicy(allow_targetless=["scene.create"]),
+             "snapshot_entities[0]"),
+            ("group", "set", {"object_id": "kids", "entities": ["lock.front_door"]},
+             ServicesPolicy(allow_targetless=["group.set"]), "entities[0]"),
+            ("group", "set",
+             {"object_id": "kids", "add_entities": ["light.kitchen", _BEDROOM]},
+             ServicesPolicy(allow_targetless=["group.set"]), "add_entities[1]"),
+            ("group", "set",
+             {"object_id": "kids", "remove_entities": "lock.front_door"},
+             ServicesPolicy(allow_targetless=["group.set"]), "remove_entities"),
+            # nested script variables
+            ("script", "turn_on",
+             {"entity_id": "script.kids_bedtime",
+              "variables": {"who": {"lock": "lock.front_door"}}},
+             None, "variables.who.lock"),
+            # non-selector keys under target are data too
+            ("media_player", "join",
+             {"target": {"entity_id": "media_player.living",
+                         "group_members": [_BEDROOM]}},
+             None, "target.group_members[0]"),
+            # canonicalised like entity_id: CSV split + lowercase
+            ("media_player", "join",
+             {"entity_id": "media_player.living",
+              "group_members": "media_player.kitchen, MEDIA_PLAYER.BEDROOM"},
+             None, "group_members"),
+        ],
+    )
+    async def test_unwritable_entity_in_data_denied(
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        services: ServicesPolicy | None,
+        key: str,
+    ):
+        payload = await _assert_denied(
+            _svc_client(services), domain, service, data,
+            reason_contains=f"key '{key}'",
+        )
+        assert payload["entity_id"] in {self._BEDROOM, "lock.front_door"}
+
+    async def test_state_only_entity_in_data_denied(self):
+        """An entity with a state but no registry entry still counts."""
+        await _assert_denied(
+            _svc_client(state_only={"media_player.guest"}),
+            "media_player", "join",
+            {"entity_id": "media_player.living",
+             "group_members": ["media_player.guest"]},
+            reason_contains="group_members",
+        )
+
+    @pytest.mark.parametrize(
+        ("domain", "service", "data", "services"),
+        [
+            ("media_player", "join",
+             {"entity_id": "media_player.living",
+              "group_members": ["media_player.kitchen"]}, None),
+            ("tts", "speak",
+             {"entity_id": "tts.piper",
+              "media_player_entity_id": "media_player.living",
+              "message": "lock.front_door is not an entity id here, the whole "
+                         "string is the message"}, None),
+            # looks like an id but names no entity → just data
+            ("media_player", "play_media",
+             {"entity_id": "media_player.living",
+              "media_content_id": "spotify.track",
+              "media_content_type": "music"}, None),
+            ("scene", "apply", {"entities": {"light.kitchen": "on"}},
+             ServicesPolicy(allow_targetless=["scene.apply"])),
+            ("group", "set",
+             {"object_id": "kids", "entities": ["light.kitchen", "light.landing"]},
+             ServicesPolicy(allow_targetless=["group.set"])),
+        ],
+    )
+    async def test_writable_or_non_entity_data_allowed(
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        services: ServicesPolicy | None,
+    ):
+        await _assert_allowed(_svc_client(services), domain, service, data)
+
+    async def test_unverifiable_id_in_data_fails_closed(self):
+        """A failed state lookup (None) counts as a known entity."""
+        from unittest.mock import AsyncMock
+
+        client = _svc_client()
+        client.policy.cache._state_exists = AsyncMock(return_value=None)
+        await _assert_denied(
+            client, "media_player", "play_media",
+            {"entity_id": "media_player.living",
+             "media_content_id": "spotify.track"},
+            reason_contains="media_content_id",
+        )
+
+    async def test_writable_data_entity_needs_no_lookup(self):
+        from unittest.mock import AsyncMock
+
+        client = _svc_client()
+        client.policy.cache._state_exists = AsyncMock(return_value=None)
+        await _assert_allowed(
+            client, "media_player", "join",
+            {"entity_id": "media_player.living",
+             "group_members": ["media_player.kitchen"]},
+        )
+        client.policy.cache._state_exists.assert_not_awaited()
+
+    async def test_targetless_allowed_call_data_checked(self):
+        """allow_targetless does not exempt the data from the entity check."""
+        await _assert_denied(
+            _svc_client(ServicesPolicy(allow_targetless=["persistent_notification.*"])),
+            "persistent_notification", "create",
+            {"message": "x", "notification_id": "lock.front_door"},
+            reason_contains="notification_id",
+        )
+
+    async def test_ws_call_service_data_checked(self):
+        from unittest.mock import AsyncMock, patch
+
+        from fastmcp.exceptions import ToolError
+
+        client = _svc_client()
+        ws = AsyncMock()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ), pytest.raises(ToolError, match="group_members"):
+            await client.send_websocket_message({
+                "type": "call_service",
+                "domain": "media_player",
+                "service": "join",
+                "service_data": {"group_members": [self._BEDROOM]},
+                "target": {"entity_id": "media_player.living"},
+            })
+        ws.send_command.assert_not_awaited()
+
+
+class TestLabelTargetsExpandAreas:
+    """A label_id target also covers every entity of every labelled AREA."""
+
+    async def test_label_on_area_with_unwritable_entity_denied(self):
+        client = _svc_client(
+            area_labels={"landing": {"kids"}},
+            entities=EntitiesPolicy(
+                allow=_SVC_ALLOW,
+                write_deny=[EntityRule(entity_globs=["light.landing"])],
+            ),
+        )
+        payload = await _assert_denied(
+            client, "light", "turn_off", {"label_id": "kids"}
+        )
+        assert payload["entity_id"] == "light.landing"
+
+    async def test_label_on_mixed_area_denied_cross_domain(self):
+        """Area 'hall' holds the lock: a light service can't act on it."""
+        await _assert_denied(
+            _svc_client(area_labels={"hall": {"kids"}}),
+            "light", "turn_off", {"target": {"label_id": ["kids"]}},
+            reason_contains="lock.front_door",
+        )
+
+    async def test_label_on_writable_area_and_entities_allowed(self):
+        client = _svc_client(area_labels={"landing": {"cozy"}, "hall": set()})
+        await _assert_allowed(client, "light", "turn_off", {"label_id": "cozy"})
+        await _assert_allowed(
+            _svc_client(), "light", "turn_off", {"label_id": "lights"}
+        )
+
+    async def test_label_unresolvable_without_area_registry(self):
+        client = _svc_client()
+        client.policy.cache._area_labels = None
+        await _assert_denied(
+            client, "light", "turn_off", {"label_id": "lights"},
+            reason_contains="area registry",
+        )
+
+
+class TestHomeassistantProxyExemption:
+    """homeassistant.turn_on/off/toggle may not proxy to script/automation/scene."""
+
+    @pytest.mark.parametrize(
+        ("service", "target"),
+        [
+            ("turn_on", "script.kids_bedtime"),
+            ("turn_off", "automation.kids_lights"),
+            ("toggle", "automation.kids_lights"),
+            ("turn_on", "scene.kids_evening"),
+            ("turn_on", ["light.kitchen", "script.kids_bedtime"]),
+        ],
+    )
+    async def test_proxy_to_runnable_domain_denied(
+        self, service: str, target: str | list[str]
+    ):
+        await _assert_denied(
+            _svc_client(), "homeassistant", service,
+            {"entity_id": target, "variables": {"x": 1}},
+            reason_contains="script/automation/scene",
+        )
+
+    async def test_update_entity_keeps_exemption(self):
+        await _assert_allowed(
+            _svc_client(), "homeassistant", "update_entity",
+            {"entity_id": ["script.kids_bedtime", "automation.kids_lights"]},
+        )
+
+    @pytest.mark.parametrize(
+        ("domain", "target"),
+        [("script", "script.kids_bedtime"),
+         ("automation", "automation.kids_lights"),
+         ("scene", "scene.kids_evening")],
+    )
+    async def test_own_domain_service_allowed(self, domain: str, target: str):
+        await _assert_allowed(
+            _svc_client(), domain, "turn_on", {"entity_id": target}
+        )
+
+    async def test_listing_in_allow_targeted_does_not_reopen_it(self):
+        client = _svc_client(ServicesPolicy(allow_targeted=["homeassistant.*"]))
+        await _assert_denied(
+            client, "homeassistant", "turn_on",
+            {"entity_id": "script.kids_bedtime"},
+            reason_contains="script/automation/scene",
+        )
+
+    async def test_explicit_allow_cross_domain_permits(self):
+        client = _svc_client(
+            ServicesPolicy(allow_cross_domain=["homeassistant.turn_on"])
+        )
+        await _assert_allowed(
+            client, "homeassistant", "turn_on", {"entity_id": "script.kids_bedtime"}
+        )
+
+
+class TestUnknownTargets:
+    """Every resolved target of a targeted call must be an entity HA knows."""
+
+    @pytest.mark.parametrize(
+        ("domain", "service", "target"),
+        [
+            ("shell_command", "x", "shell_command.fake"),
+            ("light", "turn_on", "light.ghost"),
+            ("homeassistant", "turn_on", ["light.kitchen", "switch.ghost"]),
+        ],
+    )
+    async def test_unknown_target_denied_under_default_allow(
+        self, domain: str, service: str, target: str | list[str]
+    ):
+        await _assert_denied(
+            _svc_client(default_action="allow"), domain, service,
+            {"entity_id": target}, reason_contains="unknown target entity",
+        )
+
+    async def test_unknown_writable_by_glob_denied_under_default_deny(self):
+        """light.* allows light.ghost, but there is no such entity."""
+        await _assert_denied(
+            _svc_client(), "light", "turn_on", {"entity_id": "light.ghost"},
+            reason_contains="unknown target entity",
+        )
+
+    async def test_unwritable_unknown_gets_plain_denial(self):
+        """The write check runs first: no existence oracle for denied ids."""
+        payload = await _assert_denied(
+            _svc_client(), "switch", "turn_on", {"entity_id": "switch.ghost"}
+        )
+        assert "unknown" not in payload["error"]["details"]
+
+    async def test_state_only_target_is_known(self):
+        await _assert_allowed(
+            _svc_client(default_action="allow", state_only={"group.legacy"}),
+            "group", "reload_members", {"entity_id": "group.legacy"},
+        )
+
+    async def test_unverifiable_target_denied(self):
+        from unittest.mock import AsyncMock
+
+        client = _svc_client(default_action="allow")
+        client.policy.cache._state_exists = AsyncMock(return_value=None)
+        await _assert_denied(
+            client, "light", "turn_on", {"entity_id": "light.ghost"},
+            reason_contains="could not verify",
+        )
+
+    async def test_known_targets_need_no_lookup(self):
+        from unittest.mock import AsyncMock
+
+        client = _svc_client(default_action="allow")
+        client.policy.cache._state_exists = AsyncMock(return_value=None)
+        await _assert_allowed(
+            client, "light", "turn_on", {"entity_id": ["light.kitchen", "light.landing"]}
+        )
+        client.policy.cache._state_exists.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Entity + device label/area union
 # ---------------------------------------------------------------------------
@@ -1209,6 +1570,23 @@ class TestExpandTargets:
         result = await p.expand_targets(device_ids=["ghost-device"])
         assert result == set()
 
+    async def test_expand_label_includes_labelled_area(self):
+        """HA expands a label through areas too: every entity in the area."""
+        p = self._policy_with_entities()
+        p.cache._area_labels = {"alice_bedroom": {"owner:bob"}, "kitchen": set()}
+        result = await p.expand_targets(label_ids=["owner:bob"])
+        assert result == {"light.bob_bed", "light.alice_bed", "sensor.alice_temp"}
+
+    async def test_expand_label_without_area_registry_raises(self):
+        from ha_mcp.access_policy import UnresolvableTargetError
+
+        p = self._policy_with_entities()
+        p.cache._area_labels = None
+        with pytest.raises(UnresolvableTargetError):
+            await p.expand_targets(label_ids=["owner:bob"])
+        # area/device targets don't need the area registry
+        assert await p.expand_targets(area_ids=["kitchen"]) == {"light.kitchen"}
+
 
 # ---------------------------------------------------------------------------
 # Version validation
@@ -1263,67 +1641,67 @@ class TestGlobalSingleton:
 
 
 class RecordingClient:
-    """Minimal client that returns pre-programmed registry responses."""
+    """Minimal client answering registry fetches by message type.
 
-    def __init__(self, responses: list[Any]):
-        self._responses = list(responses)
+    ``responses`` maps a registry ("entity", "device", "label", "area") to
+    the responses for successive refreshes; a registry without (remaining)
+    responses answers an empty success.
+    """
+
+    _EMPTY: ClassVar[dict[str, Any]] = {"success": True, "result": []}
+
+    def __init__(self, responses: dict[str, list[Any]]):
+        self._responses = {k: list(v) for k, v in responses.items()}
         self.call_count = 0
 
     async def send_websocket_message(self, msg: dict[str, Any]) -> Any:
         self.call_count += 1
-        # Pop two at a time (entity then device) per _refresh call
-        return self._responses.pop(0)
+        registry = msg["type"].split("/")[1].removesuffix("_registry")
+        queue = self._responses.get(registry) or [self._EMPTY]
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+
+def _registry(*entries: dict[str, Any]) -> dict[str, Any]:
+    return {"success": True, "result": list(entries)}
+
+
+def _entity(entity_id: str) -> dict[str, Any]:
+    return {"entity_id": entity_id, "area_id": None, "labels": [], "device_id": None}
 
 
 class TestCacheTTL:
-    # Each _refresh() issues 3 WS calls (entity_registry, device_registry,
-    # label_registry). The empty-registry sentinel used across these tests:
-    _EMPTY: ClassVar[dict[str, Any]] = {"success": True, "result": []}
+    # Each _refresh() issues 4 WS calls (entity, device, label and area
+    # registries).
 
     async def test_invalidate_forces_refresh(self):
         """invalidate() sets _fetched_at back to 0, so next ensure_fresh refetches."""
         # Two entities on first fetch, one on second fetch
-        client = RecordingClient(
-            responses=[
-                {"success": True, "result": [
-                    {"entity_id": "light.a", "area_id": None, "labels": [], "device_id": None},
-                    {"entity_id": "light.b", "area_id": None, "labels": [], "device_id": None},
-                ]},
-                self._EMPTY,  # device registry
-                self._EMPTY,  # label registry
-                {"success": True, "result": [
-                    {"entity_id": "light.a", "area_id": None, "labels": [], "device_id": None},
-                ]},
-                self._EMPTY,
-                self._EMPTY,
-            ]
-        )
+        client = RecordingClient({
+            "entity": [
+                _registry(_entity("light.a"), _entity("light.b")),
+                _registry(_entity("light.a")),
+            ],
+        })
         cache = EntityMetadataCache(client, ttl=3600.0)  # type: ignore[arg-type]
         await cache.ensure_fresh()
         assert set(cache._entities.keys()) == {"light.a", "light.b"}
-        assert client.call_count == 3
+        assert client.call_count == 4
 
         cache.invalidate()
         await cache.ensure_fresh()
         assert set(cache._entities.keys()) == {"light.a"}
-        assert client.call_count == 6
+        assert client.call_count == 8
 
     async def test_failed_refresh_keeps_previous_cache_but_marks_fetched(self):
         """When entity_registry fetch fails after prior success, keep old cache
         but DO advance _fetched_at so we don't stampede the backend on every call."""
-        client = RecordingClient(
-            responses=[
-                {"success": True, "result": [
-                    {"entity_id": "light.a", "area_id": None, "labels": [], "device_id": None},
-                ]},
-                self._EMPTY,  # device
-                self._EMPTY,  # label
+        client = RecordingClient({
+            "entity": [
+                _registry(_entity("light.a")),
                 # Second refresh: entity_registry fails
                 RuntimeError("entity registry down"),
-                self._EMPTY,
-                self._EMPTY,
-            ]
-        )
+            ],
+        })
         cache = EntityMetadataCache(client, ttl=0.0)  # type: ignore[arg-type] — force re-refresh each call
         await cache.ensure_fresh()
         assert "light.a" in cache._entities
@@ -1336,38 +1714,98 @@ class TestCacheTTL:
 
     async def test_initial_fetched_at_triggers_refresh(self):
         """With _fetched_at=0.0, the very first ensure_fresh must actually refresh."""
-        client = RecordingClient(
-            responses=[self._EMPTY, self._EMPTY, self._EMPTY]
-        )
+        client = RecordingClient({})
         cache = EntityMetadataCache(client, ttl=60.0)  # type: ignore[arg-type]
         assert cache._fetched_at == 0.0
         await cache.ensure_fresh()
-        assert client.call_count == 3
+        assert client.call_count == 4
 
     async def test_label_registry_names_expanded_into_meta_labels(self):
         """The cache fetches label_registry and expands label IDs on entities
         to include their human names, enabling policy rules to reference
         labels by either spelling."""
-        client = RecordingClient(
-            responses=[
-                # entity_registry: one entity with a label ID
-                {"success": True, "result": [{
-                    "entity_id": "light.alice_bed",
-                    "area_id": None,
-                    "labels": ["owner_alice"],  # HA stores the slug/id
-                    "device_id": None,
-                }]},
-                self._EMPTY,  # device_registry
-                # label_registry: maps id -> human name
-                {"success": True, "result": [
-                    {"label_id": "owner_alice", "name": "owner:alice"},
-                ]},
-            ]
-        )
+        client = RecordingClient({
+            # entity_registry: one entity with a label ID
+            "entity": [_registry({
+                "entity_id": "light.alice_bed",
+                "area_id": None,
+                "labels": ["owner_alice"],  # HA stores the slug/id
+                "device_id": None,
+            })],
+            # label_registry: maps id -> human name
+            "label": [_registry({"label_id": "owner_alice", "name": "owner:alice"})],
+        })
         cache = EntityMetadataCache(client, ttl=3600.0)  # type: ignore[arg-type]
         await cache.ensure_fresh()
         resolved = cache._entities["light.alice_bed"]
         assert resolved.labels == {"owner_alice", "owner:alice"}
+
+    async def test_area_labels_cached_separately(self):
+        """Area labels come from area_registry, expanded to ids | names, and
+        do NOT leak into the entity's own labels (rule matching unchanged)."""
+        client = RecordingClient({
+            "entity": [_registry({
+                "entity_id": "light.kid", "area_id": "kid_room",
+                "labels": [], "device_id": None,
+            })],
+            "label": [_registry({"label_id": "kids", "name": "Kids"})],
+            "area": [_registry(
+                {"area_id": "kid_room", "name": "Kid", "labels": ["kids"]},
+                {"area_id": "hall", "name": "Hall"},
+            )],
+        })
+        cache = EntityMetadataCache(client, ttl=3600.0)  # type: ignore[arg-type]
+        await cache.ensure_fresh()
+        assert cache.area_labels() == {"kid_room": {"kids", "Kids"}, "hall": set()}
+        assert cache._entities["light.kid"].labels == set()
+
+    async def test_area_registry_failure_keeps_unresolvable_state(self):
+        """Area registry never fetched → area_labels() is None (fail closed)."""
+        client = RecordingClient({"area": [RuntimeError("area registry down")]})
+        cache = EntityMetadataCache(client, ttl=3600.0)  # type: ignore[arg-type]
+        await cache.ensure_fresh()
+        assert cache.area_labels() is None
+
+
+class TestIsKnown:
+    """EntityMetadataCache.is_known: registry hit, else live state lookup."""
+
+    @staticmethod
+    def _cache(request_side_effect: Any = None) -> tuple[Any, Any]:
+        from unittest.mock import AsyncMock
+
+        client = RecordingClient({"entity": [_registry(_entity("light.a"))]})
+        client._request = AsyncMock(side_effect=request_side_effect)  # type: ignore[attr-defined]
+        cache = EntityMetadataCache(client, ttl=3600.0)  # type: ignore[arg-type]
+        return cache, client
+
+    async def test_registry_entity_known_without_state_lookup(self):
+        cache, client = self._cache()
+        assert await cache.is_known("light.a") is True
+        client._request.assert_not_awaited()
+
+    async def test_state_only_entity_known(self):
+        cache, client = self._cache()
+        assert await cache.is_known("group.legacy") is True
+        client._request.assert_awaited_once_with("GET", "/states/group.legacy")
+
+    async def test_404_is_unknown(self):
+        from ha_mcp.client.rest_client import HomeAssistantAPIError
+
+        cache, _ = self._cache(HomeAssistantAPIError("nope", status_code=404))
+        assert await cache.is_known("spotify.track") is False
+
+    async def test_lookup_error_is_undetermined(self):
+        from ha_mcp.client.rest_client import HomeAssistantConnectionError
+
+        cache, _ = self._cache(HomeAssistantConnectionError("down"))
+        assert await cache.is_known("light.b") is None
+
+    @pytest.mark.parametrize("value", ["light", "light.a/../x", "LIGHT.A", ""])
+    async def test_not_entity_shaped_is_unknown_without_lookup(self, value: str):
+        cache, client = self._cache()
+        assert await cache.is_known(value) is False
+        client._request.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
