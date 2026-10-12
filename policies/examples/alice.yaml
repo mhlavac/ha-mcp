@@ -42,6 +42,11 @@ services:
   # notification tray.
   allow_targetless:
     - persistent_notification.create
+  # Targeted calls may only hit entities of the service's own domain
+  # (e.g. script.* can never be aimed at one of her lights) unless the
+  # service is listed in allow_cross_domain. Optionally pin the exact
+  # services Alice may call with a target:
+  # allow_targeted: [light.turn_on, light.turn_off, light.toggle, media_player.*]
 
 entities:
   # Read scope: her own stuff + shared spaces.

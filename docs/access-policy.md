@@ -99,6 +99,8 @@ That's it. Everything not listed is denied. Copy, edit the patterns, done.
 | `entities.write_allow` | list[rule] \| null | `null` | If `null`, inherits `allow`. If `[]`, blocks all writes. If non-empty, restricts writes further. |
 | `entities.write_deny` | list[rule] | `[]` | Entities the agent cannot write to (even if readable). |
 | `services.allow_targetless` | list[str] | `[]` | Targetless service calls (no `entity_id`/`target`) that are permitted. See [Targetless services](#targetless-services). |
+| `services.allow_cross_domain` | list[str] | `[]` | Services allowed to target entities of **another** domain (e.g. `music_assistant.*` on `media_player.*`). See [Targeted services](#targeted-services). |
+| `services.allow_targeted` | list[str] \| null | `null` | If `null`, any service may be called with a target. If set, **only** these services may be called with a target (`[]` blocks every targeted call). See [Targeted services](#targeted-services). |
 
 ### Entity rule fields
 
@@ -245,6 +247,90 @@ so the agent knows to ask for an update.
 `readonly_mode: true` denies every targetless call regardless of the list —
 the allow-list is only consulted when writes are permitted at all.
 
+`allow_targetless` only covers calls **without** a target. It never lets the
+same service be called *with* a target — that is governed by the rules below.
+
+## Targeted services
+
+A targeted call names at least one target — `entity_id`, `device_id`,
+`area_id` or `label_id`, at the top level or under `target`. Device, area and
+label targets are expanded to their entities. Every resolved entity must be
+writable, **and** the service itself must pass two service-level checks.
+Checking only the entities is not enough. HA passes free-form service data
+straight through to some services. Without the service check,
+`script.front_door_open` "targeted" at an allowed light would pass every
+entity check and still run the script.
+
+### Cross-domain rule (always on)
+
+A targeted call is denied unless the service's domain matches the domain of
+**every** resolved target entity. For example, `light.turn_on` may target
+`light.*` but not `switch.*`. This blocks `script.*`, `shell_command.*`,
+`rest_command.*`, `hassio.*`, `notify.*` and similar services from being
+aimed at an entity you allowed for a different purpose.
+
+Exceptions:
+
+- **Built-in:** `homeassistant.turn_on`, `homeassistant.turn_off`,
+  `homeassistant.toggle` and `homeassistant.update_entity`. These services
+  dispatch to each target's own domain, so they can target any entity.
+  Each target is still write-checked.
+- **`services.allow_cross_domain`:** add `domain.service` or `domain.*`
+  for integration services that act on other domains' entities:
+
+```yaml
+services:
+  allow_cross_domain:
+    - music_assistant.*          # play_media etc. on media_player.* entities
+    - sonos.snapshot
+```
+
+Device, area and label targets are checked after expansion. For example,
+`light.turn_off` with `area_id: kitchen` is denied if the kitchen also
+contains a `switch` or `sensor`. Even before this rule, an area target only
+passed if every entity in the area was writable. To act on a mixed area,
+list the `entity_id`s explicitly.
+
+`script.<name>` services always run `script.<name>`, whatever they target.
+So for a targeted `script.<name>` call, the `script.<name>` entity must be
+writable too. The domain's own services (`script.turn_on`, `script.turn_off`,
+`script.toggle` and `script.reload`) only check their targets.
+
+### `allow_targeted`: an allow-list for targeted calls (optional)
+
+```yaml
+services:
+  allow_targeted:
+    - light.turn_on
+    - light.turn_off
+    - media_player.*
+```
+
+When `allow_targeted` is set, every targeted call's `domain.service` must
+match an entry, and anything else is denied. An empty list (`[]`) blocks
+every targeted call. When it is unset (`null`, the default), any service
+may be called with a target, subject to the cross-domain rule and the
+entity checks. `allow_targeted` is checked **in addition** to the
+cross-domain rule. Listing a service here does not let it target another
+domain; it also needs an `allow_cross_domain` entry. The built-in
+`homeassistant.*` services are **not** implied, so list them if the agent
+needs them. Use `allow_targeted` for narrow agents, such as a kid's agent
+or a voice satellite, where you know the full set of actions in advance.
+
+Entries in `allow_cross_domain` and `allow_targeted` use the same format as
+`allow_targetless`: `domain.service` or `domain.*`, lowercase. Invalid
+entries and unknown keys fail validation at startup. A denial returns
+`ACCESS_DENIED`, naming the service and the rule it broke (`cross-domain`
+or `services.allow_targeted`).
+
+### How `entity_id` values are read
+
+HA splits a comma-separated `entity_id` string and lowercases each id
+before acting on it. The policy does the same, so a value like
+`"light.ok, lock.front_door"` is checked as two entities, and
+`"LOCK.FRONT_DOOR"` is still caught by a `lock.*` deny rule. `entity_id: all`
+in any letter case is always denied.
+
 ## Tool disabling
 
 Some tools (backups, add-ons, YAML editing) don't have an entity_id and can't
@@ -303,10 +389,15 @@ isolation:
    and the logbook REST endpoint, plus WebSocket responses from
    `entity_registry/*`, `device_registry/list`, `homeassistant/expose_entity/list`,
    and `zone/list`. Entity-scoped WS commands (`todo/item/*`,
-   `homeassistant/expose_entity`) are pre-gated before dispatch. Targetless
-   service calls (no `entity_id`/`target`) are denied unless explicitly
-   allow-listed in `services.allow_targetless` — see
-   [Targetless services](#targetless-services). This covers the bulk of
+   `homeassistant/expose_entity`) are pre-gated before dispatch, as are
+   WebSocket `call_service` messages, which go through the same service-call
+   gate as REST. WebSocket `execute_script` is always denied under a policy.
+   Targetless service calls (no `entity_id`/`target`) are denied unless
+   explicitly allow-listed in `services.allow_targetless`. For targeted calls,
+   the service is checked as well as the entities: the cross-domain rule and
+   the optional `services.allow_targeted` (see
+   [Targetless services](#targetless-services) and
+   [Targeted services](#targeted-services)). This covers the bulk of
    MCP tools — search, state reads, service calls, automations, scripts,
    helpers, todo lists, voice-assistant exposure, etc.
 

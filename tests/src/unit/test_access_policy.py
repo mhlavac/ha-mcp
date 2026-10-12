@@ -471,6 +471,533 @@ class TestTargetlessServices:
 
 
 # ---------------------------------------------------------------------------
+# Targeted service calls: cross-domain rule + allow_targeted (hi-hx8.52)
+# ---------------------------------------------------------------------------
+
+
+class TestTargetedServiceConfig:
+    """Schema of services.allow_cross_domain / services.allow_targeted."""
+
+    def test_defaults(self):
+        s = ServicesPolicy()
+        assert s.allow_cross_domain == []
+        assert s.allow_targeted is None
+
+    def test_valid_entries_accepted(self):
+        s = ServicesPolicy(
+            allow_cross_domain=["music_assistant.*", "sonos.snapshot"],
+            allow_targeted=["light.turn_on", "media_player.*"],
+        )
+        assert s.allow_cross_domain == ["music_assistant.*", "sonos.snapshot"]
+        assert s.allow_targeted == ["light.turn_on", "media_player.*"]
+        # Empty allow_targeted is valid and distinct from None (unset).
+        assert ServicesPolicy(allow_targeted=[]).allow_targeted == []
+
+    @pytest.mark.parametrize("field", ["allow_cross_domain", "allow_targeted"])
+    @pytest.mark.parametrize(
+        "bad",
+        ["music_assistant", "Light.turn_on", "light.turn*", "light.", ".turn_on",
+         "light.turn_on.extra", "*.*", "*"],
+    )
+    def test_invalid_entries_rejected(self, field: str, bad: str):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match=f"services.{field}"):
+            ServicesPolicy(**{field: [bad]})
+
+    def test_unknown_services_key_rejected(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            ServicesPolicy.model_validate({"allow_crossdomain": ["sonos.*"]})
+
+    def test_yaml_roundtrip_and_unknown_key(self, tmp_path: Path):
+        good = tmp_path / "good.yaml"
+        good.write_text(
+            "version: 1\n"
+            "services:\n"
+            "  allow_cross_domain: ['music_assistant.*']\n"
+            "  allow_targeted: ['light.turn_on', 'music_assistant.play_media']\n"
+        )
+        cfg = load_policy_from_file(good)
+        assert cfg.services.allow_cross_domain == ["music_assistant.*"]
+        assert cfg.services.allow_targeted == [
+            "light.turn_on", "music_assistant.play_media",
+        ]
+
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("version: 1\nservices:\n  allow_target: ['light.turn_on']\n")
+        with pytest.raises(PolicyLoadError, match="validation"):
+            load_policy_from_file(bad)
+
+        bad_entry = tmp_path / "bad_entry.yaml"
+        bad_entry.write_text("version: 1\nservices:\n  allow_targeted: ['light']\n")
+        with pytest.raises(PolicyLoadError, match="allow_targeted"):
+            load_policy_from_file(bad_entry)
+
+
+class TestTargetedServiceDenial:
+    """AccessPolicy.targeted_service_denial — the pure service-level gate."""
+
+    def test_same_domain_allowed(self):
+        p = make_policy(PolicyConfig())
+        assert p.targeted_service_denial("light", "turn_on", ["light.a"]) is None
+
+    def test_cross_domain_denied_by_default(self):
+        p = make_policy(PolicyConfig())
+        reason = p.targeted_service_denial("script", "front_door_open", ["light.a"])
+        assert reason is not None
+        assert "cross-domain" in reason
+        assert "script.front_door_open" in reason
+        assert "allow_cross_domain" in reason
+
+    def test_mixed_targets_denied(self):
+        """EVERY target must be in the service's domain, not just one."""
+        p = make_policy(PolicyConfig())
+        assert p.targeted_service_denial(
+            "light", "turn_on", ["light.a", "switch.b"]
+        ) is not None
+
+    def test_id_without_domain_denied(self):
+        p = make_policy(PolicyConfig())
+        assert p.targeted_service_denial("light", "turn_on", ["light"]) is not None
+        assert p.targeted_service_denial("light", "turn_on", ["none"]) is not None
+
+    def test_domain_prefix_is_not_a_domain_match(self):
+        """``light_extra.x`` is not in the ``light`` domain."""
+        p = make_policy(PolicyConfig())
+        assert p.targeted_service_denial(
+            "light", "turn_on", ["light_extra.x"]
+        ) is not None
+
+    @pytest.mark.parametrize(
+        "service", ["turn_on", "turn_off", "toggle", "update_entity"]
+    )
+    def test_homeassistant_builtins_exempt(self, service: str):
+        p = make_policy(PolicyConfig())
+        assert p.targeted_service_denial(
+            "homeassistant", service, ["light.a", "switch.b"]
+        ) is None
+
+    def test_other_homeassistant_services_not_exempt(self):
+        p = make_policy(PolicyConfig())
+        assert p.targeted_service_denial(
+            "homeassistant", "reload_config_entry", ["light.a"]
+        ) is not None
+
+    def test_allow_cross_domain_exact_and_wildcard(self):
+        p = make_policy(PolicyConfig(services=ServicesPolicy(
+            allow_cross_domain=["music_assistant.*", "sonos.snapshot"],
+        )))
+        assert p.targeted_service_denial(
+            "music_assistant", "play_media", ["media_player.x"]
+        ) is None
+        assert p.targeted_service_denial(
+            "sonos", "snapshot", ["media_player.x"]
+        ) is None
+        assert p.targeted_service_denial(
+            "sonos", "restore", ["media_player.x"]
+        ) is not None
+
+    def test_allow_targeted_restricts_services(self):
+        p = make_policy(PolicyConfig(services=ServicesPolicy(
+            allow_targeted=["light.turn_on", "light.turn_off"],
+        )))
+        assert p.targeted_service_denial("light", "turn_on", ["light.a"]) is None
+        reason = p.targeted_service_denial("light", "toggle", ["light.a"])
+        assert reason is not None and "allow_targeted" in reason
+        # homeassistant.* is NOT implied by allow_targeted.
+        assert p.targeted_service_denial(
+            "homeassistant", "turn_off", ["light.a"]
+        ) is not None
+
+    def test_allow_targeted_empty_blocks_every_targeted_call(self):
+        p = make_policy(PolicyConfig(services=ServicesPolicy(allow_targeted=[])))
+        assert p.targeted_service_denial("light", "turn_on", ["light.a"]) is not None
+
+    def test_allow_targeted_does_not_bypass_cross_domain(self):
+        p = make_policy(PolicyConfig(services=ServicesPolicy(
+            allow_targeted=["music_assistant.*"],
+        )))
+        reason = p.targeted_service_denial(
+            "music_assistant", "play_media", ["media_player.x"]
+        )
+        assert reason is not None and "cross-domain" in reason
+
+    def test_case_insensitive_like_ha(self):
+        """HA lowercases domain/service, so the gate matches on lowercase."""
+        p = make_policy(PolicyConfig(services=ServicesPolicy(
+            allow_targeted=["light.turn_on"],
+        )))
+        assert p.targeted_service_denial("LIGHT", "Turn_On", ["light.a"]) is None
+        assert p.targeted_service_denial(
+            "Script", "front_door_open", ["light.a"]
+        ) is not None
+
+
+# Entities for the client-level enforcement tests below.
+_SVC_ENTITIES = {
+    "light.kitchen": meta(
+        "light.kitchen", area_id="kitchen", labels={"lights"}, device_id="dev_k"
+    ),
+    "light.kitchen_2": meta(
+        "light.kitchen_2", area_id="kitchen", labels={"lights"}, device_id="dev_k"
+    ),
+    "media_player.living": meta("media_player.living", area_id="living"),
+    "switch.porch": meta("switch.porch", area_id="porch"),
+    "lock.front_door": meta("lock.front_door", area_id="hall"),
+    "script.kids_bedtime": meta("script.kids_bedtime"),
+    "script.front_door_open": meta("script.front_door_open"),
+}
+
+_SVC_ALLOW = [
+    EntityRule(
+        entity_globs=[
+            "light.*",
+            "media_player.living",
+            "switch.porch",
+            "script.kids_bedtime",
+        ]
+    )
+]
+
+
+def _svc_client(services: ServicesPolicy | None = None, **cfg_kwargs: Any):
+    """HomeAssistantClient with a policy and a mocked transport.
+
+    ``_request`` is an AsyncMock, so a test can assert that a denied call
+    never reached Home Assistant.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from ha_mcp.client.rest_client import HomeAssistantClient
+
+    cfg_kwargs.setdefault("entities", EntitiesPolicy(allow=_SVC_ALLOW))
+    cfg = PolicyConfig(services=services or ServicesPolicy(), **cfg_kwargs)
+    with patch.object(HomeAssistantClient, "__init__", lambda self, **kw: None):
+        client = HomeAssistantClient()
+    client.base_url = "http://test.local:8123"
+    client.token = "test-token"
+    client.timeout = 30
+    client.httpx_client = MagicMock()
+    client.policy = make_policy(cfg, dict(_SVC_ENTITIES))
+    client._request = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    return client
+
+
+async def _assert_denied(
+    client: Any, domain: str, service: str, data: dict[str, Any],
+    *, reason_contains: str | None = None,
+) -> dict[str, Any]:
+    """Call the service, assert ACCESS_DENIED, and that HA was never called."""
+    import json
+
+    from fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError) as exc:
+        await client.call_service(domain, service, data)
+    payload = json.loads(str(exc.value))
+    assert payload["error"]["code"] == "ACCESS_DENIED"
+    if reason_contains is not None:
+        assert reason_contains in payload["error"]["details"]
+    client._request.assert_not_awaited()
+    return payload
+
+
+async def _assert_allowed(
+    client: Any, domain: str, service: str, data: dict[str, Any]
+) -> None:
+    await client.call_service(domain, service, data)
+    client._request.assert_awaited_once()
+    assert client._request.await_args.args[:2] == (
+        "POST", f"/services/{domain}/{service}"
+    )
+
+
+class TestServiceCallEnforcement:
+    """End-to-end (offline) through HomeAssistantClient.call_service."""
+
+    @pytest.mark.parametrize(
+        ("domain", "service", "data"),
+        [
+            ("script", "front_door_open", {"entity_id": "light.kitchen"}),
+            ("shell_command", "x", {"entity_id": "light.kitchen"}),
+            ("rest_command", "x", {"entity_id": "light.kitchen"}),
+            ("hassio", "addon_restart",
+             {"addon": "core_ssh", "entity_id": "light.kitchen"}),
+            ("notify", "x",
+             {"message": "hi", "target": {"entity_id": "light.kitchen"}}),
+        ],
+    )
+    async def test_cross_domain_denied(
+        self, domain: str, service: str, data: dict[str, Any]
+    ):
+        client = _svc_client()
+        payload = await _assert_denied(
+            client, domain, service, data, reason_contains="cross-domain"
+        )
+        assert f"{domain}.{service}" in payload["error"]["message"]
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"target": {"entity_id": "light.kitchen"}},
+            {"target": {"entity_id": ["light.kitchen"]}},
+            {"device_id": "dev_k"},
+            {"area_id": "kitchen"},
+            {"label_id": "lights"},
+            {"target": {"device_id": ["dev_k"]}},
+            {"target": {"area_id": "kitchen"}},
+            {"target": {"label_id": "lights"}},
+        ],
+    )
+    async def test_cross_domain_denied_for_every_selector_shape(
+        self, data: dict[str, Any]
+    ):
+        """Script aimed at allowed lights via every selector → denied."""
+        client = _svc_client()
+        await _assert_denied(
+            client, "script", "front_door_open", data,
+            reason_contains="cross-domain",
+        )
+
+    async def test_same_domain_allowed(self):
+        await _assert_allowed(
+            _svc_client(), "light", "turn_on", {"entity_id": "light.kitchen"}
+        )
+
+    async def test_same_domain_area_target_allowed(self):
+        await _assert_allowed(
+            _svc_client(), "light", "turn_off", {"target": {"area_id": "kitchen"}}
+        )
+
+    @pytest.mark.parametrize(
+        "service", ["turn_on", "turn_off", "toggle", "update_entity"]
+    )
+    async def test_homeassistant_builtins_allowed(self, service: str):
+        await _assert_allowed(
+            _svc_client(), "homeassistant", service, {"entity_id": "light.kitchen"}
+        )
+
+    async def test_homeassistant_builtin_still_entity_checked(self):
+        """The exemption is from the domain rule only, not the entity check."""
+        payload = await _assert_denied(
+            _svc_client(), "homeassistant", "turn_off",
+            {"entity_id": ["light.kitchen", "lock.front_door"]},
+        )
+        assert payload["entity_id"] == "lock.front_door"
+
+    async def test_music_assistant_denied_by_default(self):
+        await _assert_denied(
+            _svc_client(), "music_assistant", "play_media",
+            {"entity_id": "media_player.living", "media_id": "x"},
+            reason_contains="cross-domain",
+        )
+
+    @pytest.mark.parametrize(
+        "entry", ["music_assistant.*", "music_assistant.play_media"]
+    )
+    async def test_music_assistant_allowed_with_cross_domain(self, entry: str):
+        client = _svc_client(ServicesPolicy(allow_cross_domain=[entry]))
+        await _assert_allowed(
+            client, "music_assistant", "play_media",
+            {"entity_id": "media_player.living", "media_id": "x"},
+        )
+
+    async def test_cross_domain_allowlist_still_entity_checked(self):
+        client = _svc_client(ServicesPolicy(allow_cross_domain=["script.*"]))
+        await _assert_denied(
+            client, "script", "front_door_open", {"entity_id": "lock.front_door"}
+        )
+
+    # -- allow_targeted -----------------------------------------------------
+
+    @staticmethod
+    def _targeted_client() -> Any:
+        return _svc_client(
+            ServicesPolicy(allow_targeted=["light.turn_on", "light.turn_off"])
+        )
+
+    async def test_allow_targeted_permits_listed(self):
+        await _assert_allowed(
+            self._targeted_client(), "light", "turn_on",
+            {"entity_id": "light.kitchen"},
+        )
+
+    async def test_allow_targeted_denies_unlisted_same_domain(self):
+        await _assert_denied(
+            self._targeted_client(), "light", "toggle",
+            {"entity_id": "light.kitchen"}, reason_contains="allow_targeted",
+        )
+
+    async def test_allow_targeted_denies_homeassistant_builtin(self):
+        await _assert_denied(
+            self._targeted_client(), "homeassistant", "turn_off",
+            {"entity_id": "light.kitchen"}, reason_contains="allow_targeted",
+        )
+
+    async def test_allow_targeted_denies_integration_service(self):
+        await _assert_denied(
+            self._targeted_client(), "sonos", "update_alarm",
+            {"entity_id": "switch.porch", "alarm_id": 1},
+        )
+
+    async def test_allow_targeted_and_cross_domain_combine(self):
+        client = _svc_client(ServicesPolicy(
+            allow_targeted=["sonos.*"], allow_cross_domain=["sonos.update_alarm"],
+        ))
+        await _assert_allowed(
+            client, "sonos", "update_alarm", {"entity_id": "switch.porch"}
+        )
+
+    # -- script.<name> runs itself, whatever it targets ---------------------
+
+    async def test_script_service_targeting_writable_script_still_checks_itself(self):
+        """script.front_door_open aimed at a writable script → still denied."""
+        payload = await _assert_denied(
+            _svc_client(), "script", "front_door_open",
+            {"entity_id": "script.kids_bedtime"},
+        )
+        assert payload["entity_id"] == "script.front_door_open"
+
+    async def test_script_service_on_itself_allowed(self):
+        await _assert_allowed(
+            _svc_client(), "script", "kids_bedtime",
+            {"entity_id": "script.kids_bedtime"},
+        )
+
+    async def test_script_turn_on_checks_only_targets(self):
+        await _assert_allowed(
+            _svc_client(), "script", "turn_on", {"entity_id": "script.kids_bedtime"}
+        )
+
+    # -- entity_id canonicalization (HA splits CSV + lowercases) ------------
+
+    async def test_csv_entity_id_string_is_split(self):
+        """'light.kitchen, lock.front_door' is two targets in HA, not one."""
+        client = _svc_client(
+            entities=EntitiesPolicy(allow=[EntityRule(entity_globs=["light.kitchen*"])])
+        )
+        await _assert_denied(
+            client, "homeassistant", "turn_off",
+            {"entity_id": "light.kitchen, lock.front_door"},
+        )
+
+    async def test_uppercase_entity_id_hits_deny_rules(self):
+        client = _svc_client(
+            default_action="allow",
+            entities=EntitiesPolicy(write_deny=[EntityRule(entity_globs=["lock.*"])]),
+        )
+        await _assert_denied(
+            client, "lock", "unlock", {"entity_id": "LOCK.FRONT_DOOR"}
+        )
+
+    async def test_uppercase_all_wildcard_denied(self):
+        client = _svc_client(default_action="allow")
+        await _assert_denied(
+            client, "homeassistant", "turn_on", {"entity_id": "ALL"},
+            reason_contains="'all'",
+        )
+
+    # -- unchanged behaviour ------------------------------------------------
+
+    async def test_readonly_mode_denies_targeted(self):
+        client = _svc_client(readonly_mode=True)
+        await _assert_denied(
+            client, "light", "turn_on", {"entity_id": "light.kitchen"}
+        )
+
+    async def test_targetless_denied_by_default(self):
+        await _assert_denied(
+            _svc_client(), "persistent_notification", "create", {"message": "x"},
+            reason_contains="allow_targetless",
+        )
+
+    async def test_targetless_governed_by_allow_targetless_only(self):
+        """allow_targeted / the domain rule don't touch targetless calls."""
+        client = _svc_client(ServicesPolicy(
+            allow_targetless=["persistent_notification.create", "script.front_door_open"],
+            allow_targeted=[],
+        ))
+        await client.call_service("persistent_notification", "create", {"message": "x"})
+        await client.call_service("script", "front_door_open", {})
+        assert client._request.await_count == 2
+
+    async def test_targetless_allowlist_does_not_cover_targeted(self):
+        """allow_targetless doesn't let the same service be aimed cross-domain."""
+        client = _svc_client(ServicesPolicy(allow_targetless=["script.*"]))
+        await _assert_denied(
+            client, "script", "front_door_open", {"entity_id": "light.kitchen"},
+            reason_contains="cross-domain",
+        )
+
+
+class TestWebSocketServiceCallEnforcement:
+    """WS ``call_service`` goes through the same gate as REST."""
+
+    @staticmethod
+    def _ws_client() -> tuple[Any, Any]:
+        from unittest.mock import AsyncMock
+
+        client = _svc_client()
+        ws = AsyncMock()
+        ws.send_command = AsyncMock(return_value={"success": True})
+        return client, ws
+
+    async def test_ws_call_service_cross_domain_denied(self):
+        from unittest.mock import AsyncMock, patch
+
+        from fastmcp.exceptions import ToolError
+
+        client, ws = self._ws_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ), pytest.raises(ToolError, match="cross-domain"):
+            await client.send_websocket_message({
+                "type": "call_service",
+                "domain": "script",
+                "service": "front_door_open",
+                "target": {"entity_id": "light.kitchen"},
+            })
+        ws.send_command.assert_not_awaited()
+
+    async def test_ws_call_service_same_domain_allowed(self):
+        from unittest.mock import AsyncMock, patch
+
+        client, ws = self._ws_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ):
+            await client.send_websocket_message({
+                "type": "call_service",
+                "domain": "light",
+                "service": "turn_on",
+                "service_data": {"brightness": 10},
+                "target": {"entity_id": "light.kitchen"},
+            })
+        ws.send_command.assert_awaited_once()
+
+    async def test_ws_execute_script_denied(self):
+        from unittest.mock import AsyncMock, patch
+
+        from fastmcp.exceptions import ToolError
+
+        client, ws = self._ws_client()
+        with patch(
+            "ha_mcp.client.websocket_client.get_websocket_client",
+            AsyncMock(return_value=ws),
+        ), pytest.raises(ToolError, match="ACCESS_DENIED"):
+            await client.send_websocket_message({
+                "type": "execute_script",
+                "sequence": [{"action": "lock.unlock",
+                              "target": {"entity_id": "lock.front_door"}}],
+            })
+        ws.send_command.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Entity + device label/area union
 # ---------------------------------------------------------------------------
 

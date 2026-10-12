@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
 import httpx
 
-from ..access_policy import bypass_policy_filter
+from ..access_policy import bypass_policy_filter, implied_service_entity
 from ..config import get_global_settings
 from ..errors import create_access_denied_error, raise_tool_error
 
@@ -37,6 +37,24 @@ def _as_str_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(x) for x in value]
     return [str(value)]
+
+
+def _as_entity_ids(value: Any) -> list[str]:
+    """Normalize an ``entity_id`` selector the way HA resolves it.
+
+    HA's ``cv.comp_entity_ids`` splits a comma-separated string, strips each
+    part and lowercases it before acting on it, so policy checks must run on
+    that canonical form. Otherwise ``"light.ok, lock.front_door"`` would be
+    checked as ONE opaque id (matching a ``light.ok*`` glob) and
+    ``"LOCK.FRONT_DOOR"`` / ``"ALL"`` would slip past deny globs, the
+    ``all`` wildcard guard and the cross-domain rule. List elements are split
+    too — HA rejects such elements anyway, so over-splitting is only stricter.
+    """
+    return [
+        part.strip().lower()
+        for item in _as_str_list(value)
+        for part in item.split(",")
+    ]
 
 
 class HomeAssistantError(Exception):
@@ -290,13 +308,19 @@ class HomeAssistantClient:
     async def _enforce_service_call_policy(
         self, domain: str, service: str, payload: dict[str, Any]
     ) -> None:
-        """Verify every entity implicated by a service call is writable.
+        """Verify a service call is permitted and every entity it touches is writable.
 
         Scans EVERY target selector at BOTH the top level of the payload AND
         under ``payload["target"]`` — entity_id, device_id, area_id, label_id,
         floor_id — and expands each indirect target via the metadata cache.
-        Raises ACCESS_DENIED if any touched entity is not writable, or if
-        expansion of a target yields zero entities.
+        Raises ACCESS_DENIED if any touched entity is not writable, if
+        expansion of a target yields zero entities, or if the SERVICE itself
+        may not be called with this target (``services.allow_targeted`` /
+        the always-on cross-domain rule, see
+        ``AccessPolicy.targeted_service_denial``). Checking only the
+        entities is not enough: ``script.front_door_open`` "targeted" at an
+        allowed light would pass every entity check and still run the
+        script, because HA hands free-form service data to the script.
 
         Both levels must be scanned because HA's REST service endpoint treats
         ``target`` and the top-level service data as ONE namespace
@@ -321,7 +345,9 @@ class HomeAssistantClient:
                 _as_str_list(target.get(key))
             )
 
-        entity_ids: set[str] = _sel("entity_id")
+        entity_ids: set[str] = set(_as_entity_ids(payload.get("entity_id"))) | set(
+            _as_entity_ids(target.get("entity_id"))
+        )
 
         # HA accepts entity_id="all" as a wildcard affecting every entity of a
         # domain. That cannot be reconciled with per-entity policy, so deny it
@@ -379,6 +405,18 @@ class HomeAssistantClient:
                     ),
                 )
             return
+
+        # Service-level gate for targeted calls: allow_targeted (if set) and
+        # the always-on cross-domain rule, over the fully resolved targets.
+        reason = self.policy.targeted_service_denial(domain, service, entity_ids)
+        if reason is not None:
+            _deny(f"{domain}.{service}", operation=op, reason=reason)
+
+        # script.<name> runs script.<name> whatever it targets — it must be
+        # writable too, not just the (same-domain) targets.
+        implied = implied_service_entity(domain, service)
+        if implied is not None:
+            entity_ids.add(implied)
 
         for eid in sorted(entity_ids):
             if not await self.policy.can_write(eid):
@@ -1036,11 +1074,36 @@ class HomeAssistantClient:
         """Deny entity-scoped WS commands touching unreadable/unwritable entities.
 
         Raises ACCESS_DENIED (via ``_deny``) if the requested entity_id is
-        outside policy scope. Unknown command types pass through — the
-        post-response filter and/or the REST-layer gate handle them.
+        outside policy scope. ``call_service`` gets the same gate as the REST
+        service path; ``execute_script`` (an ad-hoc action sequence that can
+        call any service) is refused outright. Other unknown command types
+        pass through — the post-response filter and/or the REST-layer gate
+        handle them.
         """
         assert self.policy is not None  # narrowed by caller
-        gate = self._WS_ENTITY_GATES.get(message.get("type") or "")
+        msg_type = message.get("type") or ""
+        if msg_type == "call_service":
+            # HA merges ``target`` into ``service_data`` (service_data.update
+            # (target)) before dispatch; mirror that and reuse the REST gate.
+            service_data = message.get("service_data")
+            payload = dict(service_data) if isinstance(service_data, dict) else {}
+            ws_target = message.get("target")
+            if isinstance(ws_target, dict):
+                payload.update(ws_target)
+            await self._enforce_service_call_policy(
+                str(message.get("domain") or ""),
+                str(message.get("service") or ""),
+                payload,
+            )
+            return
+        if msg_type == "execute_script":
+            _deny(
+                "execute_script",
+                operation="ws:execute_script",
+                reason="ad-hoc script execution can call any service and is "
+                "not permitted under a policy",
+            )
+        gate = self._WS_ENTITY_GATES.get(msg_type)
         if gate is None:
             return
         op, field, kind, access = gate

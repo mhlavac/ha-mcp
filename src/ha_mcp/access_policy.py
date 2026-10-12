@@ -29,7 +29,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+)
 
 if TYPE_CHECKING:
     from .client.rest_client import HomeAssistantClient
@@ -115,23 +122,45 @@ class ServicesPolicy(BaseModel):
 
     Targetless service calls (no ``entity_id``/``target``) cannot be gated
     per-entity, so they are denied by default under a policy. List entries
-    here to allow specific ones.
+    in ``allow_targetless`` to allow specific ones.
+
+    Targeted calls are gated per-entity AND per-service: a service may only
+    target entities of its own domain (``light.turn_on`` → ``light.*``)
+    unless it is a built-in ``homeassistant.*`` entity service or listed in
+    ``allow_cross_domain``. ``allow_targeted``, when set, further restricts
+    which services may be called with a target at all.
+
+    All lists take "domain.service" strings (e.g.
+    "persistent_notification.create") or "domain.*" for every service in a
+    domain.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    # "domain.service" strings (e.g. "persistent_notification.create") or
-    # "domain.*" to allow every service in a domain. Entries are matched
-    # case-sensitively against the lowercase domain.service of each call.
+    # Targetless calls that are permitted. Entries are matched
+    # case-sensitively against the domain.service of each call.
     allow_targetless: list[str] = Field(default_factory=list)
+    # Services allowed to target entities of ANOTHER domain (e.g.
+    # "music_assistant.*" acting on media_player entities). The cross-domain
+    # rule is always on; this list is the only way to relax it.
+    allow_cross_domain: list[str] = Field(default_factory=list)
+    # When None (unset), any service may be called with a target (subject to
+    # the cross-domain rule and the per-entity write checks). When set, ONLY
+    # the listed services may be called with a target — an empty list blocks
+    # every targeted call. homeassistant.* services are not implied.
+    allow_targeted: list[str] | None = None
 
-    @field_validator("allow_targetless")
+    @field_validator("allow_targetless", "allow_cross_domain", "allow_targeted")
     @classmethod
-    def _check_service_specs(cls, v: list[str]) -> list[str]:
+    def _check_service_specs(
+        cls, v: list[str] | None, info: ValidationInfo
+    ) -> list[str] | None:
+        if v is None:
+            return v
         bad = [s for s in v if not _SERVICE_SPEC_RE.match(s)]
         if bad:
             raise ValueError(
-                "services.allow_targetless entries must be 'domain.service' or "
+                f"services.{info.field_name} entries must be 'domain.service' or "
                 f"'domain.*' (lowercase), got invalid: {bad}"
             )
         return v
@@ -402,6 +431,62 @@ def _is_write_tool(annotations: dict[str, Any] | None) -> bool:
     return ann.get("readOnlyHint") is not True
 
 
+# ``homeassistant.*`` entity services that dispatch to each target entity's
+# own domain, so targeting another domain is their whole purpose. They are
+# exempt from the cross-domain rule; their targets are still write-checked.
+_BUILTIN_CROSS_DOMAIN_SERVICES: frozenset[str] = frozenset(
+    {
+        "homeassistant.turn_on",
+        "homeassistant.turn_off",
+        "homeassistant.toggle",
+        "homeassistant.update_entity",
+    }
+)
+
+
+# The script domain's own services; every OTHER ``script.<object_id>``
+# service runs the script entity ``script.<object_id>`` itself.
+_SCRIPT_DOMAIN_SERVICES: frozenset[str] = frozenset(
+    {"turn_on", "turn_off", "toggle", "reload"}
+)
+
+
+def implied_service_entity(domain: str, service: str) -> str | None:
+    """Return the entity a service call acts on regardless of its target.
+
+    ``script.front_door_open`` runs ``script.front_door_open`` whatever it is
+    "targeted" at — a same-domain target such as a writable
+    ``script.kids_bedtime`` would otherwise satisfy both the cross-domain
+    rule and the per-entity check. Callers write-check the returned entity
+    alongside the targets of a targeted call.
+    """
+    domain, service = domain.lower(), service.lower()
+    if domain == "script" and service not in _SCRIPT_DOMAIN_SERVICES:
+        return f"script.{service}"
+    return None
+
+
+@dataclass(frozen=True)
+class _ServiceSpecSet:
+    """``domain.service`` / ``domain.*`` entries pre-split for O(1) matching."""
+
+    exact: frozenset[str]
+    wildcard_domains: frozenset[str]  # domains listed as ``domain.*``
+
+    @classmethod
+    def from_specs(cls, specs: Iterable[str]) -> _ServiceSpecSet:
+        specs = list(specs)
+        return cls(
+            exact=frozenset(s for s in specs if not s.endswith(".*")),
+            wildcard_domains=frozenset(s[:-2] for s in specs if s.endswith(".*")),
+        )
+
+    def matches(self, domain: str, service: str) -> bool:
+        return (
+            f"{domain}.{service}" in self.exact or domain in self.wildcard_domains
+        )
+
+
 class AccessPolicy:
     """Policy engine.
 
@@ -414,14 +499,14 @@ class AccessPolicy:
         self.cache = cache
         self._disabled_names = set(cfg.tools.disabled_names)
         self._disabled_tags = set(cfg.tools.disabled_tags)
-        # Pre-split allow_targetless into exact and wildcard sets for O(1) match.
-        self._targetless_exact: set[str] = set()
-        self._targetless_wildcards: set[str] = set()  # domains with ``.*``
-        for entry in cfg.services.allow_targetless:
-            if entry.endswith(".*"):
-                self._targetless_wildcards.add(entry[:-2])
-            else:
-                self._targetless_exact.add(entry)
+        services = cfg.services
+        self._targetless = _ServiceSpecSet.from_specs(services.allow_targetless)
+        self._cross_domain = _ServiceSpecSet.from_specs(services.allow_cross_domain)
+        self._targeted: _ServiceSpecSet | None = (
+            None
+            if services.allow_targeted is None
+            else _ServiceSpecSet.from_specs(services.allow_targeted)
+        )
 
     # -- Tool gating --------------------------------------------------------
 
@@ -447,9 +532,49 @@ class AccessPolicy:
         """
         if self.cfg.readonly_mode:
             return False
+        return self._targetless.matches(domain, service)
+
+    def targeted_service_denial(
+        self, domain: str, service: str, entity_ids: Iterable[str]
+    ) -> str | None:
+        """Return why a TARGETED ``domain.service`` call is refused, or None.
+
+        ``entity_ids`` is the fully resolved target set (explicit entity_ids
+        plus device/area/label expansion). This is the service-level gate;
+        the caller must still write-check every target entity. Two rules:
+
+        1. ``services.allow_targeted`` (when set): ``domain.service`` must
+           match an entry. ``homeassistant.*`` services are not implied.
+        2. Cross-domain (always on): every target entity must belong to the
+           service's own domain, unless the service is one of the built-in
+           ``homeassistant.*`` entity services or matches
+           ``services.allow_cross_domain``. Without this, a service whose
+           data is free-form (``script.<name>``, ``shell_command.*``,
+           ``rest_command.*``, ``hassio.*``...) could be "targeted" at any
+           writable entity and run with arbitrary effect.
+
+        Domain/service are lowercased first, as HA's service registry does.
+        """
+        domain, service = domain.lower(), service.lower()
+        spec = f"{domain}.{service}"
+        if self._targeted is not None and not self._targeted.matches(domain, service):
+            return (
+                f"{spec} is not listed in services.allow_targeted; add "
+                f"'{spec}' or '{domain}.*' to permit targeted calls to it"
+            )
+        if spec in _BUILTIN_CROSS_DOMAIN_SERVICES or self._cross_domain.matches(
+            domain, service
+        ):
+            return None
+        # An id without a "." has no domain and can never match (fail-closed).
+        foreign = sorted(e for e in entity_ids if not e.startswith(f"{domain}."))
+        if not foreign:
+            return None
+        shown = ", ".join(foreign[:5]) + (", ..." if len(foreign) > 5 else "")
         return (
-            f"{domain}.{service}" in self._targetless_exact
-            or domain in self._targetless_wildcards
+            f"cross-domain call: {spec} may only target '{domain}.*' entities, "
+            f"but the target includes {shown}; add '{spec}' or '{domain}.*' to "
+            "services.allow_cross_domain to permit"
         )
 
     # -- Entity gating ------------------------------------------------------
