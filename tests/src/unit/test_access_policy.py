@@ -717,6 +717,46 @@ async def _assert_allowed(
 class TestServiceCallEnforcement:
     """End-to-end (offline) through HomeAssistantClient.call_service."""
 
+    # -- the service name is a slug, never a path --------------------------
+    @pytest.mark.parametrize(
+        ("domain", "service"),
+        [
+            ("light", "../script/front_door_open"),
+            ("light", "turn_on/../../script/front_door_open"),
+            ("light", "..%2Fscript%2Ffront_door_open"),
+            ("light", "turn_on?x=1"),
+            ("../script", "front_door_open"),
+            ("light", ""),
+        ],
+    )
+    async def test_path_like_service_names_are_refused(
+        self, domain: str, service: str
+    ):
+        """httpx collapses "..": without this, the gate saw light.* and HA ran
+        script.front_door_open."""
+        await _assert_denied(
+            _svc_client(), domain, service, {"entity_id": "light.kitchen"},
+            reason_contains="slug",
+        )
+
+    async def test_service_name_is_normalised_before_the_gate(self):
+        client = _svc_client()
+        await client.call_service(" Light ", "TURN_ON", {"entity_id": "light.kitchen"})
+        assert client._request.await_args.args[:2] == ("POST", "/services/light/turn_on")
+
+    async def test_state_and_event_paths_are_quoted(self):
+        from unittest.mock import AsyncMock
+
+        client = _svc_client()
+        client.policy = None
+        client._request = AsyncMock(return_value={})  # type: ignore[method-assign]
+        await client.get_entity_state("light.x/../../services/script/front_door_open")
+        assert client._request.await_args.args[1] == (
+            "/states/light.x%2F..%2F..%2Fservices%2Fscript%2Ffront_door_open"
+        )
+        await client.fire_event("x/../../services/script/front_door_open")
+        assert client._request.await_args.args[1].startswith("/events/x%2F..")
+
     @pytest.mark.parametrize(
         ("domain", "service", "data"),
         [

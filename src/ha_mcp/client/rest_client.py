@@ -5,7 +5,9 @@ Home Assistant HTTP client with authentication and error handling.
 import asyncio
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +19,18 @@ if TYPE_CHECKING:
     from ..access_policy import AccessPolicy
 
 logger = logging.getLogger(__name__)
+
+
+# Home Assistant domains and service names are lowercase slugs. Anything else
+# would be interpolated into a REST path, and httpx normalises "..": service
+# "../script/front_door_open" with domain "light" reaches
+# /services/script/front_door_open after the policy approved a light.
+_SLUG_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _path_segment(value: str) -> str:
+    """Quote one REST path segment so it can never add or climb a segment."""
+    return quote(str(value), safe="")
 
 
 def _deny(entity_id: str, operation: str, reason: str | None = None) -> NoReturn:
@@ -233,7 +247,7 @@ class HomeAssistantClient:
         if self.policy is not None and not await self.policy.can_read(entity_id):
             _deny(entity_id, operation="read")
         logger.debug(f"Fetching state for entity: {entity_id}")
-        return await self._request("GET", f"/states/{entity_id}")
+        return await self._request("GET", f"/states/{_path_segment(entity_id)}")
 
     async def set_entity_state(
         self, entity_id: str, state: str, attributes: dict[str, Any] | None = None
@@ -257,7 +271,9 @@ class HomeAssistantClient:
         if attributes:
             payload["attributes"] = attributes
 
-        return await self._request("POST", f"/states/{entity_id}", json=payload)
+        return await self._request(
+            "POST", f"/states/{_path_segment(entity_id)}", json=payload
+        )
 
     async def call_service(
         self, domain: str, service: str, data: dict[str, Any] | None = None,
@@ -277,6 +293,13 @@ class HomeAssistantClient:
             Service response data - list of affected states normally, or dict with
             service response if return_response=True
         """
+        domain, service = str(domain).strip().lower(), str(service).strip().lower()
+        if not (_SLUG_RE.fullmatch(domain) and _SLUG_RE.fullmatch(service)):
+            _deny(
+                f"{domain}.{service}",
+                operation="call_service",
+                reason="domain and service must be lowercase slugs ([a-z0-9_]+)",
+            )
         logger.debug(f"Calling service {domain}.{service} (return_response={return_response})")
 
         payload = data or {}
@@ -530,7 +553,9 @@ class HomeAssistantClient:
         logger.debug(f"Firing event: {event_type}")
 
         payload = data or {}
-        return await self._request("POST", f"/events/{event_type}", json=payload)
+        return await self._request(
+            "POST", f"/events/{_path_segment(event_type)}", json=payload
+        )
 
     async def render_template(self, template: str) -> str:
         """
