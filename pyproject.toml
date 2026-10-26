@@ -24,13 +24,13 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastmcp==3.2.0",
+    "fastmcp==3.4.11",
     "httpx[socks]==0.28.1",
     "pydantic==2.12.5",
     "python-dotenv==1.2.2",
     "truststore==0.10.4",
     "websockets==16.0",
-    "cryptography==46.0.6",
+    "cryptography==50.0.2",
     "ruamel.yaml>=0.18.0",
 ]
 
